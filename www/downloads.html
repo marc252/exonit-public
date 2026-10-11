@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ExoNit — Downloads</title>
+  <link rel="stylesheet" href="/static/exonit.css">
+</head>
+<body>
+  <canvas id="bgScene" aria-hidden="true"></canvas>
+  <nav class="console">
+    <a class="brand" href="/">EXONIT</a>
+    <a href="/">Dashboard</a>
+    <a href="/results">Results</a>
+    <a href="/completion">Completion</a>
+    <a href="/downloads" aria-current="page">Downloads</a>
+    <a href="/status">Status</a>
+    <a href="/sky">Sky</a>
+    <span class="console-live"><span data-fx-toggle>FX on</span></span>
+  </nav>
+
+  <main class="page">
+    <header class="page-head">
+      <div class="kicker">Downloads</div>
+      <h1>TGLC downloads</h1>
+      <p>Fetch TGLC light curves from NASA MAST for a sector, and see how much of it is downloaded.</p>
+    </header>
+
+    <div class="stack">
+      <section class="card elev-sm toolbar" id="toolbarCard">
+        <div class="field">
+          <label for="dlSector">Sector</label>
+          <select id="dlSector" class="input">
+            <option value="">Loading…</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="dlCount">Count</label>
+          <input id="dlCount" class="input" type="number" min="1" value="100000">
+        </div>
+        <button id="btnDownload" class="btn btn-primary" type="button"></button>
+        <div id="dlMsg" class="fact-alert card-alert toolbar-msg" hidden></div>
+      </section>
+
+      <div class="cols">
+        <section class="card elev-sm" id="headlineBlock"></section>
+
+        <section class="card elev-sm" id="progressBlock"></section>
+
+        <div class="row row-3 span-all" id="sectorStatsBlock"></div>
+      </div>
+    </div>
+  </main>
+
+  <script type="module">
+    import { getJSON, postJSON } from '/js/api.js';
+    import { esc, fmtInt, fmtPct } from '/js/format.js';
+    import { poll } from '/js/poll.js';
+    import { stat, bar, tag, icon } from '/js/ui.js';
+    import { initScene, fxEnabled, toggleFx } from '/js/scene.js';
+
+    initScene(document.getElementById('bgScene'), { mode: 'ambient' });
+    const fxToggle = document.querySelector('[data-fx-toggle]');
+    fxToggle.textContent = fxEnabled() ? 'FX on' : 'FX off';
+    fxToggle.addEventListener('click', toggleFx);
+
+    const headlineEl = document.getElementById('headlineBlock');
+    const progressEl = document.getElementById('progressBlock');
+    const statsEl = document.getElementById('sectorStatsBlock');
+    const sectorSelect = document.getElementById('dlSector');
+    const countInput = document.getElementById('dlCount');
+    const btnDownload = document.getElementById('btnDownload');
+    const msgEl = document.getElementById('dlMsg');
+
+    btnDownload.innerHTML = `${icon('download')} Download batch`;
+
+    // ── State ──
+    let sectors = [];
+    let selectedSector = null;
+    let lastStatus = null;      // last /api/discovery/download/status payload
+    let wasRunning = null;      // tracks running:true -> false to refresh sector stats
+    let pollHandle = null;
+
+    const sectorState = (s) => s.state || (s.enabled ? 'active' : 'coming_soon');
+    const gb = (bytes) => `${(bytes / 1e9).toFixed(1)} GB`;
+
+    // ── Sectors: select options + stat cards (recomputed locally, no refetch) ──
+    async function loadSectors() {
+      try {
+        const d = await getJSON('/api/discovery/sectors');
+        sectors = d.sectors || [];
+        if (selectedSector === null) {
+          const active = sectors.find((s) => s.number === d.active_sector);
+          const firstOpen = sectors.find((s) => sectorState(s) !== 'coming_soon');
+          selectedSector = (active || firstOpen || sectors[0] || {}).number ?? null;
+        }
+        renderSectorOptions();
+        renderSectorStats();
+        renderHeadline();
+      } catch (err) {
+        sectorSelect.innerHTML = '<option value="">Error loading sectors</option>';
+      }
+    }
+
+    function renderSectorOptions() {
+      sectorSelect.innerHTML = sectors.map((s) => {
+        const st = sectorState(s);
+        const disabled = st === 'coming_soon' ? ' disabled' : '';
+        const selected = s.number === selectedSector ? ' selected' : '';
+        const label = st === 'complete'
+          ? `Sector ${s.number} (complete)`
+          : st === 'coming_soon'
+          ? `Sector ${s.number} — coming soon`
+          : `Sector ${s.number}`;
+        return `<option value="${s.number}"${disabled}${selected}>${esc(label)}</option>`;
+      }).join('');
+    }
+
+    function onSectorChange() {
+      const n = parseInt(sectorSelect.value, 10);
+      selectedSector = Number.isNaN(n) ? null : n;
+      renderSectorStats();
+      renderHeadline();
+    }
+    sectorSelect.addEventListener('change', onSectorChange);
+
+    function renderSectorStats() {
+      const s = sectors.find((x) => x.number === selectedSector) || null;
+      const total = s ? s.total_tics : null;
+      const downloaded = s ? s.downloaded : null;
+      const pending = (total != null && downloaded != null) ? Math.max(0, total - downloaded) : null;
+      statsEl.innerHTML = [
+        stat('Total TICs', fmtInt(total)),
+        stat('Downloaded', fmtInt(downloaded)),
+        stat('Pending download', fmtInt(pending)),
+      ].join('');
+    }
+
+    // ── Shared state classification (used by headline + progress blocks) ──
+    function classify(d) {
+      const total = d.total || 0;
+      const done = d.done || 0;
+      const pctFraction = total > 0 ? Math.min(1, done / total) : 0;
+      const indexing = d.phase === 'indexing' || (d.running && total > 0 && done >= total);
+      return { total, done, pctFraction, indexing };
+    }
+
+    // ── Block 1: headline — state in words + one number ──
+    function renderHeadline() {
+      const s = sectors.find((x) => x.number === selectedSector) || null;
+      const kicker = s ? `Sector ${s.number}` : 'Downloads';
+
+      if (!lastStatus) {
+        headlineEl.innerHTML = stat(kicker, '—', 'Loading download state…');
+        return;
+      }
+      const d = lastStatus;
+      const { done, total, pctFraction, indexing } = classify(d);
+      let value = '—';
+      let note;
+
+      if (d.never_run) {
+        note = 'No download has run for this sector yet.';
+      } else if (d.phase === 'fetching_script') {
+        note = 'Fetching the MAST bulk script from NASA — can take several minutes for a large sector.';
+      } else if (d.phase === 'selecting') {
+        note = 'Selecting the next batch of TICs to download.';
+      } else if (d.running) {
+        value = fmtPct(pctFraction);
+        note = indexing
+          ? 'Indexing downloaded files…'
+          : `Download running — ${fmtInt(done)} of ${fmtInt(total)} TICs done.`;
+      } else if (d.phase === 'died') {
+        note = 'The download process died before finishing — check the server log.';
+      } else if (d.returncode === 0) {
+        value = fmtPct(pctFraction);
+        note = `Download finished — ${fmtInt(done)} of ${fmtInt(total)} TICs done.`;
+      } else if (d.returncode != null) {
+        note = `The download failed (exit code ${d.returncode}).`;
+      } else {
+        note = 'No download is currently running.';
+      }
+      headlineEl.innerHTML = stat(kicker, value, note);
+    }
+
+    // ── Block 2: progress — one bar + counts as facts ──
+    function renderProgress() {
+      const d = lastStatus;
+      if (!d) {
+        progressEl.innerHTML = `
+          <div class="card-title">Download progress</div>
+          <p class="text-muted">Loading…</p>`;
+        return;
+      }
+      const { done, total, pctFraction, indexing } = classify(d);
+
+      let tagText = 'Idle';
+      let tagKind = 'neutral';
+      let barPct = 0;
+      let barDone = false;
+      let sentence = 'No download is currently running.';
+      let rateEtaText = '';
+
+      if (d.never_run) {
+        sentence = 'No download has run for this sector yet.';
+      } else if (d.phase === 'fetching_script') {
+        tagText = 'Fetching script';
+        tagKind = 'accent';
+        const bytesDone = d.script_bytes_done || 0;
+        if (d.script_bytes_total) {
+          barPct = Math.min(100, (bytesDone / d.script_bytes_total) * 100);
+          sentence = `Fetching the MAST bulk script — ${gb(bytesDone)} of ${gb(d.script_bytes_total)}.`;
+        } else {
+          barPct = 100;
+          sentence = `Fetching the MAST bulk script — ${gb(bytesDone)} downloaded so far.`;
+        }
+      } else if (d.phase === 'selecting') {
+        tagText = 'Selecting batch';
+        tagKind = 'accent';
+        sentence = 'Selecting the next batch to download…';
+      } else if (d.running) {
+        barPct = pctFraction * 100;
+        tagText = indexing ? 'Indexing' : 'Running';
+        tagKind = 'accent';
+        sentence = indexing
+          ? 'Indexing downloaded files…'
+          : `Download running — ${fmtPct(pctFraction)} done.`;
+        const hasRate = !indexing && d.rate != null && d.rate > 0;
+        const hasEta = !indexing && d.eta_min != null && d.eta_min > 0;
+        if (hasRate || hasEta) {
+          const parts = [];
+          if (hasRate) parts.push(`${d.rate.toFixed(1)} files/s`);
+          if (hasEta) parts.push(d.eta_min < 1 ? 'under 1 min left' : `about ${Math.round(d.eta_min)} min left`);
+          rateEtaText = parts.join(' · ');
+        }
+      } else {
+        barPct = pctFraction * 100;
+        if (d.phase === 'died') {
+          tagText = 'Died';
+          tagKind = 'neutral';
+          sentence = 'The download process died before finishing — check the server log.';
+        } else if (d.returncode === 0) {
+          tagText = 'Done';
+          tagKind = 'accent-2';
+          barDone = true;
+          sentence = `Download finished — ${fmtInt(done)} of ${fmtInt(total)} TICs done.`;
+        } else if (d.returncode != null) {
+          tagText = `Failed (exit ${d.returncode})`;
+          tagKind = 'neutral';
+          sentence = 'The download process exited with an error.';
+        } else {
+          tagText = 'Stopped';
+          tagKind = 'neutral';
+          sentence = 'The download stopped before finishing.';
+        }
+      }
+
+      progressEl.innerHTML = `
+        <div class="card-head">
+          <div class="card-title">Download progress</div>
+          ${tag(tagText, tagKind)}
+        </div>
+        ${bar(barPct, { size: 'lg', done: barDone })}
+        <p class="text-muted">${esc(sentence)}${rateEtaText ? ' · ' + esc(rateEtaText) : ''}</p>
+        <div class="facts">
+          <div><span>Done</span><span class="num">${fmtInt(done)}</span></div>
+          <div><span>Failed</span><span class="num">${fmtInt(d.failed)}</span></div>
+          <div><span>Skipped</span><span class="num">${fmtInt(d.skipped)}</span></div>
+          <div><span>Total</span><span class="num">${fmtInt(total)}</span></div>
+        </div>`;
+
+      btnDownload.disabled = !!d.running;
+    }
+
+    function renderAll() {
+      renderHeadline();
+      renderProgress();
+    }
+
+    // ── Messages: warnings/errors stated as a fact (accent-200), see
+    // www/CLAUDE.md "Page anatomy" rule 5 — no info banners, the progress
+    // card above is the feedback for a successful start.
+    function showMsg(text) {
+      msgEl.hidden = false;
+      msgEl.textContent = text;
+    }
+    function clearMsg() {
+      msgEl.hidden = true;
+      msgEl.textContent = '';
+    }
+
+    // ── Polling: only while a download is running, resume on load ──
+    function startPolling() {
+      if (pollHandle) return;
+      pollHandle = poll(fetchStatus, 5000);
+    }
+    function stopPolling() {
+      if (pollHandle) {
+        pollHandle.stop();
+        pollHandle = null;
+      }
+    }
+
+    async function fetchStatus() {
+      const d = await getJSON('/api/discovery/download/status');
+      lastStatus = d;
+      renderAll();
+
+      // Auto-refresh the sector stat cards once a running download (incl. its
+      // indexing tail) finishes — otherwise "Downloaded" only updates on F5.
+      if (wasRunning === true && d.running === false) {
+        loadSectors();
+      }
+      wasRunning = d.running;
+
+      if (!d.running) stopPolling();
+    }
+
+    // ── Download batch ──
+    async function startDownload() {
+      const sector = parseInt(sectorSelect.value, 10);
+      const count = parseInt(countInput.value, 10);
+      if (!sector || !count || count < 1) {
+        showMsg('Select a sector and enter a valid count.');
+        return;
+      }
+      clearMsg();
+      btnDownload.disabled = true;
+      try {
+        await postJSON('/api/discovery/download', { sector, count });
+        startPolling();
+      } catch (err) {
+        const message = String((err && err.message) || err);
+        if (message.startsWith('409')) {
+          showMsg('A download is already running — showing its progress below.');
+          startPolling();
+        } else {
+          showMsg(message);
+          btnDownload.disabled = false;
+        }
+      }
+    }
+    btnDownload.addEventListener('click', startDownload);
+
+    // ── Init ──
+    loadSectors();
+    fetchStatus().then(() => {
+      if (lastStatus && lastStatus.running) startPolling();
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,40 @@
+{
+  "_schema_version": 1,
+  "_doc": "Worker farm manifest read by bin/farmctl. Copy to ops/workers.json and edit. `ssh_host` is null for the machine that runs farmctl itself. `worker_dir` is the directory that holds worker.py and agent.py on that host; `python` is the interpreter (or native worker binary) used to run it. `instances` is the number of worker processes in the scan phase, `instances_fpp` the number in the FPP phase (0 = the host sits that phase out; `instances: 0` disables the entry in every phase). Optional per-entry `env` is exported to every worker process, optional `config` is applied on top of the host's config.json at every start, and optional `instance_overrides` (keys are 1-based instance indices as strings) tune individual instances. All values below are placeholders.",
+  "server_url": "http://<server-ip>:8400",
+  "workers": [
+    {
+      "name": "worker-linux-gpu",
+      "ssh_host": "user@<lan-ip>",
+      "platform": "linux",
+      "worker_dir": "~/exonit/worker",
+      "python": "~/exonit/worker/venv/bin/python3",
+      "instances": 2,
+      "instances_fpp": 2,
+      "config": {
+        "gpu_enabled": true
+      }
+    },
+    {
+      "name": "worker-mac-m4",
+      "ssh_host": "user@<lan-ip>",
+      "platform": "macos",
+      "worker_dir": "~/exonit-worker",
+      "python": "~/exonit-worker/venv/bin/python3",
+      "instances": 5,
+      "instances_fpp": 9,
+      "env": {
+        "EXONIT_INJECTION_METAL": "1"
+      }
+    },
+    {
+      "name": "worker-windows",
+      "ssh_host": "user@<lan-ip>",
+      "platform": "windows",
+      "worker_dir": "C:\\Users\\<user>\\exonit-worker",
+      "python": "C:\\Users\\<user>\\exonit-worker\\venv\\Scripts\\python.exe",
+      "instances": 4,
+      "instances_fpp": 6
+    }
+  ]
+}

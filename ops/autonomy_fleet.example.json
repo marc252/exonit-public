@@ -1,0 +1,19 @@
+{
+  "_doc": "Fleet known to the autonomy subsystem (SSH probes + playbook param validation). name -> {ssh, platform}. ssh='local' = this host. platform: linux|mac|windows. Path overridable with EXONIT_AUTONOMY_FLEET. Copy autonomy_fleet.example.json for a new deployment.",
+  "worker-default": {
+    "ssh": "local",
+    "platform": "linux"
+  },
+  "worker-linux-gpu": {
+    "ssh": "user@linux-gpu-host",
+    "platform": "linux"
+  },
+  "worker-mac-1": {
+    "ssh": "user@mac-host-1",
+    "platform": "mac"
+  },
+  "worker-win-1": {
+    "ssh": "user@windows-host-1",
+    "platform": "windows"
+  }
+}

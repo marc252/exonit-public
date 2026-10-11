@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "exonit"
+version = "0.1.0"
+description = "Automated exoplanet transit detection pipeline using TESS data"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [{name = "Marc Balcells Sanahuja", email = "mbalcells@gmail.com"}]
+
+[project.scripts]
+exonit = "run_nightly:main"
+
+# Deps are environment-managed (see requirements.txt / worker venvs), not
+# declared here — this packaging metadata exists solely to make `exonit`
+# importable (editable install) from any cwd for scripts/* and the
+# discovery_orchestrator subprocesses. Package list is explicit (NOT
+# packages.find auto-discovery): the repo root also holds worker/, scripts/,
+# tests/, www/, data/ (incl. the fits_cache symlink onto a 900GB NFS mount),
+# models/, train/, docs/, backups/, .git/, etc. `find` walks the whole tree
+# with followlinks=True, which hangs for minutes trying to stat the NFS
+# fits_cache — an explicit list sidesteps that entirely and is deterministic.
+# Keep in sync with `find exonit -name __init__.py` if new subpackages appear.
+[tool.setuptools]
+packages = [
+    "exonit",
+    "exonit.exominer_ffi",
+    "exonit.exominer_native",
+    "exonit.exominer_pp",
+    "exonit.routes",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["exonit", "pipeline", "train", "web", "data", "docs", "reports"]
+markers = [
+    "slow: marks tests that require cached lightcurve data (deselect with '-m \"not slow\"')",
+]

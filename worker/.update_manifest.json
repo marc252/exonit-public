@@ -1,0 +1,64 @@
+{
+  "files": [
+    {
+      "filename": "worker.py",
+      "sha256": "2762412c320d24f000543e6e7c8c8eb764ff0fa17a8a2bb26712851cf073e71d"
+    },
+    {
+      "filename": "worker_ui.py",
+      "sha256": "3fa2717fc17d41c135b0b35224a83493ad929df897de0be6d1c1958665cb1b35"
+    },
+    {
+      "filename": "fpp_native.py",
+      "sha256": "91355a9627ee0fdb30ab6044d6e41d21ad56c5cda00fd5bd89efacd7a1b4ad92"
+    },
+    {
+      "filename": "injection.py",
+      "sha256": "83ff58887697db4e9764031517daaf21b3bf73eb4e4ba0e5fc3bf85132db98e3"
+    },
+    {
+      "filename": "bls_fast.py",
+      "sha256": "7a71aa2ab99f4c23e951fd5f5ded7af3f472c6ea743c3a80930ad1edbfd0931c"
+    },
+    {
+      "filename": "bls_metal.py",
+      "sha256": "eee550b278a5fc9c44da6a286bce82627392caa00d88cec69cd245916ab96640"
+    },
+    {
+      "filename": "bls_cuda.py",
+      "sha256": "9d113548159932b211cb7f5ef2b603559dce10ea1da219332f6dec466232dfb3"
+    },
+    {
+      "filename": "bls_opencl.py",
+      "sha256": "d57160f97691a85320df4fa9ef758ad23155e26d158709b1cfcc034827f5ffbf"
+    },
+    {
+      "filename": "fpp_metal.py",
+      "sha256": "fbf332628d2d49977910d7e4f331b9e93d85cb6bf547fae4896ef0d99a0eee74"
+    },
+    {
+      "filename": "fpp_cuda.py",
+      "sha256": "56951753db38e158771f038e53e2b0030ac662e0c1d206f2b4ac594cc7d71b4b"
+    },
+    {
+      "filename": "fpp_opencl.py",
+      "sha256": "4337525b266c986829d6eec4f8a0c0e862f99a9fed9e3e45a71b658ece4f46c0"
+    },
+    {
+      "filename": "cnn.py",
+      "sha256": "134537ae56f09dd0b0c0c6f0029580847a3a847fc9edb72643d292889578b7f8"
+    },
+    {
+      "filename": "vetting.py",
+      "sha256": "1568537ddb9a7d027109f53bb1f96691becdb68b6730e87230dfee8369513f94"
+    },
+    {
+      "filename": "install.py",
+      "sha256": "f82162b61f156de090ac6fcc47e2c286c0e6414478217e81eb947a91fbdccc61"
+    },
+    {
+      "filename": "requirements.txt",
+      "sha256": "07a29e2497ea6cd64fa71adef4976b441304c300704f45bbe466da263595134c"
+    }
+  ]
+}

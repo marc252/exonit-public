@@ -1,0 +1,16 @@
+{
+    "server_url": "http://localhost:8400",
+    "token": "exonit-default-token",
+    "worker_name": "worker-default",
+    "cpu_threads": 6,
+    "gpu_enabled": false,
+    "poll_interval_seconds": 5,
+    "heartbeat_interval_seconds": 30,
+    "fits_cache_dir": "fits_cache",
+    "gui_port": 8402,
+    "fpp_cpu_cores": 6,
+    "log_file": "worker.log",
+    "log_level": "INFO",
+    "exominer_mode": "native",
+    "ffi_fallback_on_load_fail": true
+}

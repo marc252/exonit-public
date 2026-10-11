@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ExoNit — Completion</title>
+  <link rel="stylesheet" href="/static/exonit.css">
+</head>
+<body>
+  <canvas id="bgScene" aria-hidden="true"></canvas>
+  <nav class="console">
+    <a class="brand" href="/">EXONIT</a>
+    <a href="/">Dashboard</a>
+    <a href="/results">Results</a>
+    <a href="/completion" aria-current="page">Completion</a>
+    <a href="/downloads">Downloads</a>
+    <a href="/status">Status</a>
+    <a href="/sky">Sky</a>
+    <span class="console-live"><span data-fx-toggle>FX on</span></span>
+  </nav>
+
+  <main class="page">
+    <header class="page-head">
+      <div class="kicker">Campaign</div>
+      <h1>Completion</h1>
+      <p>How far the discovery campaign has worked through each sector, and the auto-fill loop
+        driving the active one to done.</p>
+    </header>
+
+    <div class="stack">
+      <section class="card elev-sm toolbar">
+        <div class="field">
+          <label>Active sector</label>
+          <div class="num" id="tbSectorNum">—</div>
+        </div>
+        <button id="afBtnStart" class="btn btn-primary" type="button">Complete sector</button>
+        <button id="afBtnStop" class="btn btn-secondary" type="button">Stop auto-fill</button>
+        <p class="text-muted toolbar-msg" id="afActionNote"></p>
+      </section>
+
+      <div class="cols">
+        <section id="headline"></section>
+
+        <section class="card elev-sm" id="afPanel" hidden>
+          <h3>Auto-fill</h3>
+          <div class="facts" id="afFacts"></div>
+          <div id="afAlert"></div>
+        </section>
+
+        <section class="card elev-sm span-all">
+          <h3>Sectors</h3>
+          <table class="table">
+            <thead>
+              <tr>
+                <th>Sector</th>
+                <th>Work list</th>
+                <th>Remaining</th>
+                <th>No data</th>
+                <th>Progress</th>
+                <th>Auto-fill</th>
+              </tr>
+            </thead>
+            <tbody id="sectorBody">
+              <tr><td colspan="6" class="text-muted">Loading&hellip;</td></tr>
+            </tbody>
+          </table>
+        </section>
+      </div>
+    </div>
+
+    <p class="text-muted" id="staleNote"></p>
+  </main>
+
+  <script type="module">
+    import { getJSON, postJSON } from '/js/api.js';
+    import { esc, fmtInt, fmtPct } from '/js/format.js';
+    import { poll, staleNote } from '/js/poll.js';
+    import { stat, meter, tag } from '/js/ui.js';
+    import { initScene, fxEnabled, toggleFx } from '/js/scene.js';
+
+    // ── shell: ambient scene, FX toggle, fixed-console offset ──
+    initScene(document.getElementById('bgScene'), { mode: 'ambient' });
+    const fxToggleEl = document.querySelector('[data-fx-toggle]');
+    fxToggleEl.textContent = `FX ${fxEnabled() ? 'on' : 'off'}`;
+    fxToggleEl.addEventListener('click', toggleFx);
+
+    let activeSectorNum = null;
+
+    /**
+     * Fraction (0..1) of a sector's work done, mirroring the old page's
+     * fallback: prefer the server-computed pct_complete, else examined/total.
+     * Works the same for closed sectors now that the server computes
+     * pct_complete for those too (2026-10-05) — no open/closed branch needed
+     * here.
+     */
+    function sectorFrac(s) {
+      if (s.pct_complete != null) return Math.min(1, s.pct_complete);
+      if (!s.total_tics) return 0;
+      return Math.min(1, (s.examined || 0) / s.total_tics);
+    }
+
+    /**
+     * Displayed denominator for a sector's progress — MUST mirror the
+     * server's own pct_complete formula (exonit/routes/discovery.py's
+     * `download_complete` rule) exactly, or the page and the number it
+     * labels disagree.
+     *
+     * Not computed yet (pct_complete == null): total_tics, same cheap
+     * fallback examined/total_tics already uses.
+     *
+     * Download verifiably complete (downloaded >= total_tics, both known
+     * and positive): work_list_size alone — total_tics is a stale/
+     * unreliable FITS-file count once nothing is left to download
+     * (2026-10-05).
+     *
+     * Otherwise (still mid-download, or total_tics/downloaded unknown):
+     * max(total_tics, work_list_size) — the pre-2026-10-05 safety net, so
+     * an open sector still receiving bulk downloads does not overstate
+     * progress against its not-yet-fully-downloaded work list (the
+     * historical "sector 23 shows 54% instead of ~24%" bug).
+     */
+    function sectorDenom(s) {
+      if (s.pct_complete == null) return s.total_tics;
+      const downloadComplete = s.total_tics > 0 && s.downloaded > 0
+        && s.downloaded >= s.total_tics;
+      if (downloadComplete) return s.work_list_size > 0 ? s.work_list_size : s.total_tics;
+      return Math.max(s.total_tics || 0, s.work_list_size || 0);
+    }
+
+    /** Single palette for auto-fill status, shared by the panel and the table cell. */
+    function afTag(status) {
+      const map = {
+        running: { label: 'Running', kind: 'accent' },
+        alert: { label: 'Alert', kind: 'accent' },
+        done: { label: 'Done', kind: 'accent-2' },
+        stopped: { label: 'Stopped', kind: 'neutral' },
+      };
+      return map[status] || { label: status, kind: 'neutral' };
+    }
+
+    function renderHeadline(active, sectors) {
+      const el = document.getElementById('headline');
+      if (!sectors.length) {
+        el.innerHTML = stat('Campaign', '—', 'No sector data available yet.');
+        return;
+      }
+      if (!active) {
+        el.innerHTML = stat('Campaign', '—', 'No sector is currently active.');
+        return;
+      }
+      const frac = sectorFrac(active);
+      const hasPct = active.pct_complete != null;
+      const denom = sectorDenom(active);
+      // "done" against the work-list denominator (hasPct) vs. the cheap
+      // enqueue cursor (fallback, labelled accordingly — not computed yet).
+      const done = hasPct ? Math.round(frac * denom) : active.examined;
+      const note = hasPct
+        ? `${fmtInt(done)} of ${fmtInt(denom)} TICs done — `
+          + `${fmtInt(active.gaps_processable)} remaining, ${fmtInt(active.no_data)} with no data.`
+        : `${fmtInt(active.examined)} of ${fmtInt(active.total_tics)} TICs examined (enqueue progress) — `
+          + `${fmtInt(active.gaps_processable)} remaining, ${fmtInt(active.no_data)} with no data.`;
+      el.innerHTML = stat(`Sector ${active.number} · active`, fmtPct(frac), note);
+    }
+
+    function renderAfPanel(active) {
+      const panel = document.getElementById('afPanel');
+      const facts = document.getElementById('afFacts');
+      const alertBox = document.getElementById('afAlert');
+      const sectorLabel = document.getElementById('tbSectorNum');
+
+      if (!active) {
+        panel.hidden = true;
+        sectorLabel.textContent = '—';
+        return;
+      }
+      panel.hidden = false;
+      sectorLabel.textContent = active.number;
+
+      const af = active.autofill;
+      const hasData = af && af.status;
+      const statusHtml = hasData ? tag(afTag(af.status).label, afTag(af.status).kind) : '—';
+      facts.innerHTML = `
+        <div><span>Status</span><span>${statusHtml}</span></div>
+        <div><span>Current lot</span><span class="num">${hasData && af.current_lot != null ? esc(String(af.current_lot)) : '—'}</span></div>
+        <div><span>Lots done</span><span class="num">${hasData && af.lots_done != null ? fmtInt(af.lots_done) : '—'}</span></div>
+      `;
+      if (hasData && af.status === 'alert' && af.last_alert) {
+        alertBox.innerHTML = `<div class="card card-alert"><div class="facts"><div><span>Last alert</span><span>${esc(af.last_alert)}</span></div></div></div>`;
+      } else {
+        alertBox.innerHTML = '';
+      }
+    }
+
+    function afCell(s) {
+      const af = s.autofill;
+      const status = af && af.status;
+      if (!status) return '<span class="text-muted">—</span>';
+      const t = afTag(status);
+      const lots = af.lots_done != null ? `<span class="text-muted"> · ${fmtInt(af.lots_done)} lots</span>` : '';
+      const alertLine = (status === 'alert' && af.last_alert)
+        ? `<div class="text-muted">${esc(af.last_alert)}</div>` : '';
+      return `<div>${tag(t.label, t.kind)}${lots}</div>${alertLine}`;
+    }
+
+    function renderTable(activeSector, sectors) {
+      const tbody = document.getElementById('sectorBody');
+      if (!sectors.length) {
+        tbody.innerHTML = '<tr><td colspan="6" class="text-muted">No sector data available.</td></tr>';
+        return;
+      }
+      tbody.innerHTML = sectors.map((s) => {
+        const isActive = s.number === activeSector;
+        const st = s.state || (s.enabled ? 'active' : 'coming_soon');
+        const rowClass = isActive ? 'row-active' : (st === 'coming_soon' ? 'row-muted' : '');
+        const sectorCell = isActive
+          ? `${fmtInt(s.number)} ${tag('active', 'outline')}`
+          : String(s.number);
+
+        if (st === 'coming_soon') {
+          return `<tr class="${rowClass}">
+            <td>${sectorCell}</td>
+            <td>— coming soon</td>
+            <td>— coming soon</td>
+            <td>— coming soon</td>
+            <td>— coming soon</td>
+            <td>—</td>
+          </tr>`;
+        }
+
+        const frac = sectorFrac(s);
+        // Round to 1 decimal before handing off to meter() — it renders
+        // `${width}%` verbatim, so an unrounded fraction*100 would spill
+        // long decimal tails into the table (fmtPct's precision, matched by hand).
+        const pct1 = Math.round(frac * 1000) / 10;
+        // "Work list" denominator (not total_tics — see sectorDenom); applies
+        // equally to open and closed sectors now that the server computes
+        // pct_complete for closed ones too.
+        const denom = sectorDenom(s);
+        return `<tr class="${rowClass}">
+          <td>${sectorCell}</td>
+          <td>${fmtInt(denom)}</td>
+          <td>${fmtInt(s.gaps_processable)}</td>
+          <td>${fmtInt(s.no_data)}</td>
+          <td>${meter('', pct1, { done: frac >= 1 })}</td>
+          <td>${afCell(s)}</td>
+        </tr>`;
+      }).join('');
+    }
+
+    async function load() {
+      const d = await getJSON('/api/discovery/sectors');
+      const sectors = (d.sectors || []).slice().sort((a, b) => a.number - b.number);
+      activeSectorNum = d.active_sector;
+      const active = sectors.find((s) => s.number === activeSectorNum) || null;
+
+      renderHeadline(active, sectors);
+      renderAfPanel(active);
+      renderTable(activeSectorNum, sectors);
+    }
+
+    async function afControl(action) {
+      const note = document.getElementById('afActionNote');
+      note.textContent = '';
+      if (!activeSectorNum) {
+        note.textContent = 'No active sector selected.';
+        return;
+      }
+      const label = action === 'start' ? 'Complete sector' : 'Stop auto-fill';
+      const btn = document.getElementById(action === 'start' ? 'afBtnStart' : 'afBtnStop');
+      btn.disabled = true;
+      try {
+        await postJSON(`/api/discovery/sector/${activeSectorNum}/autofill`, { action });
+        await load();
+      } catch (e) {
+        note.textContent = `${label} failed: ${e.message}`;
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    document.getElementById('afBtnStart').addEventListener('click', () => afControl('start'));
+    document.getElementById('afBtnStop').addEventListener('click', () => afControl('stop'));
+
+    const handle = poll(load, 30000);
+    staleNote(document.getElementById('staleNote'), handle);
+  </script>
+</body>
+</html>

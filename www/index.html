@@ -1,0 +1,1123 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ExoNit — Dashboard</title>
+<link rel="stylesheet" href="/static/exonit.css">
+<style>
+  /* Page-local layout only. This migration may only touch index.html — the
+     "Deep Field" system's exonit.css can't grow a new global class as part
+     of this task — so the handful of Dashboard-only shapes (fixed-nav
+     clearance, the hero canvas stack, the light-curve SVG, the pipeline
+     connector rail) live in this scoped block instead of exonit.css. Every
+     value below is a var() token or a structural dimension the design spec
+     itself gives (the ~380px hero, spec §7); no new hex, no decorative px.
+     If this page's classes prove reusable, promote them into exonit.css. */
+
+  .hero.card { padding: 0; overflow: hidden; }
+
+  .hero-scene { position: relative; height: 380px; }
+  .hero-scene canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  .hero-overlay {
+    position: absolute; inset: 0; z-index: 1; display: flex; flex-direction: column;
+    justify-content: flex-end; gap: var(--sp-2); padding: var(--sp-6);
+    background: linear-gradient(180deg, transparent 0%, color-mix(in srgb, var(--ground) 80%, transparent) 100%);
+  }
+  /* FX off / no WebGL: initScene() already hid the canvas and returned a
+     no-op handle (spec §0.3). No empty 380px box, no dead light curve — the
+     headline just flows over the page's static CSS starfield fallback. */
+  .hero-scene.is-inert { height: auto; }
+  .hero-scene.is-inert .hero-overlay { position: static; background: none; padding: var(--sp-6) var(--sp-6) var(--sp-3); }
+
+  .hero-sentence {
+    margin: 0; font-family: var(--font-display); font-weight: 500; font-size: 26px;
+    line-height: 1.3; color: var(--ink); max-width: 56ch;
+  }
+  .hero-figure-row { display: flex; align-items: baseline; gap: var(--sp-3); flex-wrap: wrap; }
+  .hero-figure { color: var(--accent); } /* precedent: .gauge-value is accent too — the loudest number, not a data series */
+
+  .lightcurve-wrap { padding: var(--sp-4) var(--sp-6) 0; }
+  .lightcurve-svg { width: 100%; height: 88px; display: block; }
+  .lightcurve-grid { stroke: var(--line); stroke-width: 1; vector-effect: non-scaling-stroke; }
+  .lightcurve-grid-mid { stroke: var(--line-strong); }
+  .lightcurve-path { fill: none; stroke: var(--accent); stroke-width: 2; vector-effect: non-scaling-stroke; }
+  .lightcurve-point { fill: var(--accent); }
+  .lightcurve-caption {
+    margin: var(--sp-1) 0 0; font-family: var(--font-mono); font-size: 11px;
+    color: var(--ink-mute); text-align: center;
+  }
+
+  .hero-detail { padding: var(--sp-4) var(--sp-6) var(--sp-6); display: flex; flex-direction: column; gap: var(--sp-2); }
+
+  /* Pipeline stages: a hairline rail behind the row connects the .step
+     chips (spec: "row of stage chips connected by a hairline line"). */
+  .steps { position: relative; }
+  .steps::before { content: ""; position: absolute; left: var(--sp-2); right: var(--sp-2); top: 15px; height: 1px; background: var(--line); z-index: 0; }
+  .steps .step { position: relative; z-index: 1; }
+  .step-check { display: inline-flex; color: var(--ok); margin-right: var(--sp-1); vertical-align: -4px; }
+  .step-check svg { display: block; width: 15px; height: 15px; }
+
+  @media (max-width: 820px) {
+    .hero-scene { height: 260px; }
+    .hero-sentence { font-size: 21px; }
+  }
+</style>
+</head>
+<body>
+
+<nav class="console">
+  <a class="brand" href="/">EXONIT</a>
+  <a href="/" aria-current="page">Dashboard</a>
+  <a href="/results">Results</a>
+  <a href="/completion">Completion</a>
+  <a href="/downloads">Downloads</a>
+  <a href="/status">Status</a>
+  <a href="/sky">Sky</a>
+  <span class="console-live" id="navLive">
+    <i class="live-dot" id="navLiveDot"></i>
+    <span id="navLiveCount">— workers</span> ·
+    <span data-fx-toggle id="fxToggle" role="button" tabindex="0"></span>
+  </span>
+</nav>
+
+<main class="page">
+  <header class="page-head">
+    <div class="kicker">Pipeline</div>
+    <h1>Dashboard</h1>
+    <p>Where the current run stands, how fast it is going and when it will finish.
+      <span class="text-muted" id="staleNote"></span></p>
+  </header>
+
+  <div class="stack">
+    <!-- Hero — the signature: a star and a transiting planet (spec §3, §6.1),
+         answer-first sentence + one big number on top, a synced light curve
+         below, then the supporting numbers/status/alerts that used to be
+         block 1's whole grid. -->
+    <section class="card hero" id="heroBlock">
+      <div class="hero-scene" id="heroSceneWrap">
+        <!-- moved out of the fixed body-level canvas: exonit.css's global
+             #bgScene rule is fixed/fullscreen/z-index:-1 for the ambient
+             pages, which this task cannot edit — so the hero canvas uses
+             its own id and is sized/positioned by the .hero-scene rules
+             above instead (in-flow, ~380px, spec §3 "inside the hero block"). -->
+        <canvas id="heroCanvas" aria-hidden="true"></canvas>
+        <div class="hero-overlay" id="heroOverlay">
+          <div class="kicker">Pipeline status</div>
+          <p class="hero-sentence text-muted">Loading…</p>
+        </div>
+      </div>
+      <div class="lightcurve-wrap" id="lightcurveWrap">
+        <svg id="lightcurve" class="lightcurve-svg" viewBox="0 0 800 100" preserveAspectRatio="none" aria-hidden="true">
+          <line class="lightcurve-grid" x1="0" y1="24" x2="800" y2="24"></line>
+          <line class="lightcurve-grid" x1="0" y1="48" x2="800" y2="48"></line>
+          <line class="lightcurve-grid" x1="0" y1="72" x2="800" y2="72"></line>
+          <line class="lightcurve-grid lightcurve-grid-mid" x1="400" y1="0" x2="400" y2="100"></line>
+          <path id="lightcurvePath" class="lightcurve-path" d=""></path>
+          <circle id="lightcurvePoint" class="lightcurve-point" cx="400" cy="22" r="4"></circle>
+        </svg>
+        <p class="lightcurve-caption">relative flux · orbital phase</p>
+      </div>
+      <div class="hero-detail" id="heroDetail"></div>
+    </section>
+
+    <!-- Pipeline stages: one horizontal row of phase chips, current phase
+         illuminated, connected by a hairline rail. Same data/endpoints as
+         before; sector completion folded in underneath. -->
+    <section class="card elev-sm" id="pipeline">
+      <div class="kicker">Pipeline stages</div>
+      <h3>Where each phase of the run stands</h3>
+      <div id="pipelineBody"><p class="text-muted">Loading…</p></div>
+      <div class="hr"></div>
+      <div class="kicker">Sector completion</div>
+      <div id="sectorBody"><p class="text-muted">Loading…</p></div>
+    </section>
+
+    <!-- Toolbar: every control on the page, one .btn-primary, destructive
+         actions stay .btn-secondary with their existing confirm(). -->
+    <section class="card elev-sm toolbar" id="toolbar">
+      <div class="field">
+        <label for="scanSector">Sector</label>
+        <select class="input" id="scanSector"></select>
+      </div>
+      <div class="field">
+        <label for="scanCount">TICs to analyze</label>
+        <input class="input" type="number" id="scanCount" min="1" value="100000">
+      </div>
+      <button class="btn btn-primary" id="btnScan" type="button">Start scan</button>
+      <button class="btn btn-secondary" id="btnAutofillStart" type="button">Complete sector</button>
+      <button class="btn btn-secondary" id="btnAutofillStop" type="button">Stop auto-fill</button>
+      <button class="btn btn-secondary" id="btnStartWorkers" type="button">Start workers</button>
+      <button class="btn btn-secondary" id="btnResetStats" type="button">Reset stats</button>
+      <div class="toolbar-msg" id="toolbarMsg"></div>
+    </section>
+  </div>
+</main>
+
+<script type="module">
+import { getJSON, postJSON, authHeaders } from '/js/api.js';
+import { esc, fmtInt, fmtPct, fmtDur } from '/js/format.js';
+import { poll, staleNote } from '/js/poll.js';
+import { tag, icon } from '/js/ui.js';
+import { initScene, fxEnabled, toggleFx } from '/js/scene.js';
+
+// ── Pipeline state → plain-language sentence (headline, hero overlay) ────
+// Kept byte-identical to the pre-rebuild page (spec: "KEEP the whole
+// existing renderHeadline sentence logic"). Block 3's per-stage labels
+// (STAGE_LABELS, below) are a SEPARATE, shorter set of sentence-case labels
+// for the pipeline-stages rows — the two label sets intentionally differ in
+// wording (this one reads as a sentence continuation, that one as a noun
+// phrase in a list).
+const PIPE_LABELS = {
+  IDLE: 'Idle — no run in progress',
+  ENQUEUEING: 'Enqueueing the next lot',
+  SCANNING: 'Scanning for candidates',
+  FPP_BACKFILL: 'Backfilling false-positive probabilities',
+  EXOMINER_BACKFILL: 'Backfilling ExoMiner scores',
+  STOP_WORKERS: 'Stopping workers',
+  POSTPROCESS: 'Post-processing results',
+  AWS_FINALIZE: 'Finalising the AWS run',
+  STOP_NVIDIARACK: 'Stopping the GPU rack',
+  LORA: 'Generating LoRA explanations',
+  FREE_GPU: 'Freeing the GPU',
+  // FINALIZE is dominated by the completeness-store compaction, a silent
+  // O(dataset) rewrite of every Parquet bucket (scripts/compact_completeness.py)
+  // — without this label the run looks stalled between FREE_GPU and DONE.
+  FINALIZE: 'Finalising — compacting the completeness store (longest quiet step, typically 15–40 min)',
+  DONE: 'Run finished',
+  FAILED: 'Run failed',
+};
+
+function pipeLabel(state) {
+  return PIPE_LABELS[state] || String(state || 'unknown').replace(/_/g, ' ').toLowerCase();
+}
+
+// Rounded to 1 decimal here (not just in the bar width) because the row
+// grammar prints this number verbatim as the on-screen percentage — an
+// unrounded float (e.g. 71.53625345…) overflows the fixed 90px .track-pct
+// column (www/static/exonit.css) and violates the "max 1 decimal" number rule.
+function pct(done, baseline) {
+  if (!baseline) return 0;
+  const raw = Math.min(100, Math.max(0, (done / baseline) * 100));
+  return Math.round(raw * 10) / 10;
+}
+
+// ── Pipeline-stage block — canonical stage order + labels ────────────────
+// Source of truth: scripts/discovery_orchestrator.py STATES. IDLE/DONE/
+// FAILED are terminal, not rows (reflected in the hero sentence instead).
+// ENQUEUEING and AWS_FINALIZE are only spliced in while they are the LIVE
+// state — see buildStages().
+const BASE_STAGES = [
+  'SCANNING', 'FPP_BACKFILL', 'EXOMINER_BACKFILL', 'STOP_WORKERS',
+  'POSTPROCESS', 'STOP_NVIDIARACK', 'LORA', 'FREE_GPU', 'FINALIZE',
+];
+
+const STAGE_LABELS = {
+  SCANNING: 'Scanning for candidates',
+  FPP_BACKFILL: 'False-positive probability backfill',
+  EXOMINER_BACKFILL: 'ExoMiner backfill',
+  STOP_WORKERS: 'Stopping workers',
+  POSTPROCESS: 'Post-processing and scorecard',
+  STOP_NVIDIARACK: 'Stopping the GPU rack',
+  LORA: 'Generating explanations',
+  FREE_GPU: 'Freeing the GPU',
+  FINALIZE: 'Finalising — compacting the completeness store',
+  ENQUEUEING: 'Enqueueing the lot',
+  AWS_FINALIZE: 'Finalising the AWS run',
+};
+
+// AWS_FINALIZE sits between POSTPROCESS and STOP_NVIDIARACK in the
+// orchestrator's own STATES list; ENQUEUEING precedes everything. Both are
+// AWS-only / launch-only detours that most runs never enter, so they are
+// only shown while they are the CURRENT state (spec: "shown only while it
+// is the live state").
+function buildStages(currentState) {
+  let stages = BASE_STAGES.slice();
+  if (currentState === 'AWS_FINALIZE') {
+    const idx = stages.indexOf('POSTPROCESS') + 1;
+    stages = [...stages.slice(0, idx), 'AWS_FINALIZE', ...stages.slice(idx)];
+  }
+  if (currentState === 'ENQUEUEING') {
+    stages = ['ENQUEUEING', ...stages];
+  }
+  return stages;
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// ETA + rate — 2026-07-27: computed SERVER-side (see exonit/progress.py)
+// and arrives on /api/discovery/pipeline as `progress` + `eta_total_s`. The
+// browser used to keep its own per-run, per-phase sample ring in
+// localStorage: every tab computed its own answer, a reload threw it away,
+// and nothing outside this page could ask how long was left. That whole
+// client-side rate engine — the sample-ring constants and helpers, the
+// FPP_BACKFILL localStorage baseline hack, and the function that turned
+// samples into a rate — is gone. What remains here is presentation plus one
+// fallback — `currentPhaseProgress` + `priorEstimateSeconds`, used only when
+// a phase does not (yet) report a server-side progress record, exactly as it
+// did before this feature existed.
+// ══════════════════════════════════════════════════════════════════════
+
+// Where each queue-bearing stage's live {done, baseline, remaining} comes
+// from (spec "Where each stage's live numbers come from"). Returns null for
+// a non-queue phase or when health hasn't loaded yet. FPP_BACKFILL is no
+// longer handled here: it now always publishes a server-side progress
+// record (exonit/progress.py), so the client-side localStorage baseline
+// hack this used to need is gone — a phase without a server record falls
+// through to the prior-estimate fallback in computeRunModel() instead.
+function currentPhaseProgress(stateName, health, runId) {
+  if (!health) return null;
+  if (stateName === 'SCANNING') {
+    const p = health.primary_tasks;
+    if (!p) return null;
+    return { done: p.done, baseline: p.baseline, remaining: (p.pending || 0) + (p.assigned || 0) };
+  }
+  if (stateName === 'EXOMINER_BACKFILL') {
+    const e = health.exominer_backfill;
+    if (!e || e.baseline == null) return null;
+    return { done: e.done, baseline: e.baseline, remaining: e.pending };
+  }
+  if (stateName === 'LORA') {
+    const l = health.lora_explanation;
+    if (!l || l.baseline == null) return null;
+    return { done: l.done, baseline: l.baseline, remaining: (l.stale || 0) + (l.missing || 0) };
+  }
+  return null;
+}
+
+// Queue depth for a stage that hasn't started yet, when we happen to
+// already know it (the underlying DB rows can exist before the orchestrator
+// formally enters that phase).
+function pendingQueueDepth(stageKey, health) {
+  if (!health) return null;
+  if (stageKey === 'FPP_BACKFILL') return health.fpp_backfill ? health.fpp_backfill.actionable : null;
+  if (stageKey === 'EXOMINER_BACKFILL') return health.exominer_backfill ? health.exominer_backfill.pending : null;
+  if (stageKey === 'LORA') {
+    const l = health.lora_explanation;
+    return l ? (l.stale || 0) + (l.missing || 0) : null;
+  }
+  return null;
+}
+
+function priorEstimateSeconds(priors, phaseKey, lot) {
+  if (!priors || !priors.phases) return null;
+  const p = priors.phases[phaseKey];
+  if (!p) return null;
+  if (p.scales_with_lot && p.latest_per_1k_tics_s != null && lot) {
+    return p.latest_per_1k_tics_s * (lot / 1000);
+  }
+  if (p.latest_s != null) return p.latest_s;
+  if (p.median_s != null) return p.median_s;
+  return null;
+}
+
+// Assembles everything the hero and pipeline blocks need, purely from
+// cached state — no fetch — so it can be re-run every second for a smooth
+// countdown (spec "Performance": "re-render block 1 from cached state once
+// per second").
+//
+// 2026-07-27: rate, ETA and staleness are computed SERVER-side (see
+// exonit/progress.py) and arrive on /api/discovery/pipeline. The browser no
+// longer keeps a sample ring in localStorage: every tab used to compute its
+// own answer, a reload threw it away, and nothing outside this page could ask
+// how long was left. What remains here is presentation plus one fallback —
+// a phase that does not report yet still shows the historic prior, exactly as
+// it did before this feature existed.
+function computeRunModel() {
+  const pipeline = state.pipeline;
+  const health = state.health;
+  const priors = state.priors;
+
+  const stages = buildStages(pipeline ? pipeline.state : null);
+  let currentIndex = -1;
+  if (pipeline) {
+    currentIndex = pipeline.state === 'DONE' ? stages.length : stages.indexOf(pipeline.state);
+  }
+
+  const lot = health && health.primary_tasks ? health.primary_tasks.baseline : null;
+  const server = pipeline ? pipeline.progress : null;
+
+  let progress = null;
+  let rateInfo = { rate: null, source: null };
+  let etaCurrentSeconds = null;
+  let stale = false;
+  let staleAgeSeconds = null;
+  let substep = null;
+  let message = null;
+  let unit = null;
+
+  if (server) {
+    progress = {
+      done: server.done,
+      baseline: server.total,
+      remaining: server.remaining,
+    };
+    rateInfo = { rate: server.rate, source: server.rate_source };
+    etaCurrentSeconds = server.eta_phase_s;
+    stale = !!server.stale;
+    staleAgeSeconds = server.age_s;
+    substep = server.substep;
+    message = server.message;
+    unit = server.unit;
+  } else if (pipeline && currentIndex >= 0 && currentIndex < stages.length) {
+    // Fallback: this phase does not report yet. Historic prior minus elapsed,
+    // floored at 0 — the pre-2026-07-27 behaviour, unchanged.
+    progress = currentPhaseProgress(pipeline.state, health, pipeline.run_id);
+    const est = priorEstimateSeconds(priors, pipeline.state, lot);
+    if (est !== null) {
+      const startMs = pipeline.updated_at ? Date.parse(pipeline.updated_at) : NaN;
+      const elapsed = Number.isNaN(startMs) ? 0 : Math.max(0, (Date.now() - startMs) / 1000);
+      etaCurrentSeconds = Math.max(0, est - elapsed);
+    }
+  }
+
+  // Total: the server's answer when it has one, the old client-side sum as a
+  // fallback so a phase without a progress record still shows a total.
+  let totalRemainingSeconds = (pipeline && pipeline.eta_total_s != null)
+    ? pipeline.eta_total_s
+    : null;
+  if (totalRemainingSeconds === null && etaCurrentSeconds !== null) {
+    let total = etaCurrentSeconds;
+    let ok = true;
+    for (let i = currentIndex + 1; i < stages.length; i++) {
+      const est = priorEstimateSeconds(priors, stages[i], lot);
+      if (est === null) { ok = false; break; }
+      total += est;
+    }
+    totalRemainingSeconds = ok ? total : null;
+  }
+
+  return { stages, currentIndex, progress, rateInfo, etaCurrentSeconds,
+           totalRemainingSeconds, lot, stale, staleAgeSeconds, substep,
+           message, unit };
+}
+
+// ── Small formatting helpers specific to this page ───────────────────────
+const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+function fmtClock(d) {
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
+// Raw clock text for the "finish time" note (no "finishes ≈" prefix baked
+// in here — that reads fine inline in the hero note but not as a bare
+// standalone value).
+function finishClockText(totalRemainingSeconds) {
+  if (totalRemainingSeconds === null || totalRemainingSeconds === undefined) return null;
+  const now = new Date();
+  const finish = new Date(now.getTime() + totalRemainingSeconds * 1000);
+  const clock = fmtClock(finish);
+  return finish.toDateString() === now.toDateString()
+    ? clock
+    : `${WEEKDAYS[finish.getDay()]} ${clock}`;
+}
+
+// Rate gauge (owner request #1) — fixed 0–1000 TIC/min scale, never
+// auto-scaled. computeRunModel's rateInfo.rate is items/second; this is the
+// one place that converts it for display. Clamp the FILL at the scale max
+// but always print the true value, even past 1,000 — the spec is explicit
+// that the gauge must never silently lie about the number.
+const RATE_GAUGE_MAX_PER_MIN = 1000;
+
+function rateGaugeModel(rate) {
+  const perMin = rate && rate > 0 ? rate * 60 : null;
+  const widthPct = perMin ? Math.max(0, Math.min(100, (perMin / RATE_GAUGE_MAX_PER_MIN) * 100)) : 0;
+  return { perMin, widthPct, text: fmtInt(perMin) };
+}
+
+function elapsedRun(pipeline) {
+  if (!pipeline || !pipeline.started_at) return null;
+  const startMs = Date.parse(pipeline.started_at);
+  if (Number.isNaN(startMs)) return null;
+  return Math.max(0, (Date.now() - startMs) / 1000);
+}
+
+function fmtPriorsDate(iso) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+}
+
+// ── Hero: run status (answer first) ───────────────────────────────────────
+// /api/health/work emits alert codes as raw key=value pipeline strings
+// (exonit/routes/admin.py: "disk_free_gb=1602.1 (<5GB)", "duplicate_tics=2",
+// "stuck_workers=3", "no_workers_alive") — the API itself doesn't structure
+// them, and restructuring it is a server change out of this task's scope.
+// Humanize the known shapes client-side rather than showing the raw string
+// (www/CLAUDE.md: "Don't show raw pipeline keys").
+function humanizeAlert(a) {
+  let m;
+  if (a === 'no_workers_alive') {
+    return 'No workers are alive — <a href="#toolbar">start workers</a> to resume processing.';
+  }
+  if ((m = a.match(/^disk_free_gb=([\d.]+)/))) return `Low disk space — ${esc(m[1])} GB free.`;
+  if ((m = a.match(/^duplicate_tics=(\d+)/))) return `${esc(m[1])} TIC(s) claimed by more than one worker.`;
+  if ((m = a.match(/^stuck_workers=(\d+)/))) return `${esc(m[1])} worker(s) stuck on the same TIC.`;
+  return esc(a.replace(/_/g, ' '));
+}
+
+// Split in two: heroOverlayEl carries only the answer-first sentence plus
+// ONE big number (spec "on top... the existing headline (status sentence +
+// big number)"), painted over the live scene; heroDetailEl carries the
+// supporting numbers/status/alerts that used to share the same card as one
+// big grid. "Time remaining" moved into the hero figure and is no longer
+// repeated as its own stat-block below (www/CLAUDE.md: "don't repeat the
+// same number in two blocks") — "finishes ≈ …" rides along as its note.
+function renderHeadline() {
+  const pipeline = state.pipeline;
+  if (!pipeline) return; // sentence needs only pipeline; numbers fill in later
+  const health = state.health, stats = state.stats, setup = state.setup;
+  const model = computeRunModel();
+
+  let sentence;
+  const s = setup && setup.setup;
+  if (s && s.running) {
+    const phaseLabel = {
+      catalog: 'downloading the catalog',
+      metadata: 'downloading FITS from MAST',
+      done: 'finishing up',
+      error: 'hit an error',
+    }[s.phase] || s.phase;
+    sentence = `Initial data setup is ${esc(phaseLabel)}` +
+      (s.total ? ` — ${fmtInt(s.progress)} of ${fmtInt(s.total)} stars.` : '.');
+  } else if (pipeline.never_run) {
+    sentence = 'The pipeline has not run yet — start a scan below to begin.';
+  } else if (pipeline.state === 'FAILED') {
+    sentence = `The last run failed: ${esc(pipeline.detail || 'no detail recorded')}.`;
+  } else if (pipeline.state === 'FINALIZE' && pipeline.finalize_substep) {
+    // The orchestrator publishes which FINALIZE sub-step is live (main repo,
+    // _publish_finalize_substep) — without it this stage looks stalled.
+    const sub = {
+      campaign_update: 'updating campaign records',
+      compact_completeness: 'compacting the completeness store (longest quiet step, typically 15–40 min)',
+      recycle_workers: 'recycling server workers',
+    }[pipeline.finalize_substep] || esc(pipeline.finalize_substep.replace(/_/g, ' '));
+    sentence = `Finalising — ${sub}.`;
+  } else {
+    // Owner request #2: append the current phase's live progress to the
+    // plain-language sentence instead of leaving it a bare label, e.g.
+    // "Scanning for candidates — 22,737 of 299,944 TICs (7.6%)."
+    const base = pipeLabel(pipeline.state);
+    if (model.progress && model.progress.baseline) {
+      const donePct = pct(model.progress.done, model.progress.baseline);
+      sentence = `${base} — ${fmtInt(model.progress.done)} of ${fmtInt(model.progress.baseline)} TICs (${fmtPct(donePct / 100)}).`;
+    } else {
+      sentence = `${base}.`;
+    }
+  }
+
+  // The distinction that was missing on 2026-07-27: a phase with no signal is
+  // NOT a phase at 0%. Say which sub-step it is on, generically, for any
+  // phase that reports one (exonit/progress.py `substep`) — not just
+  // FINALIZE's own hand-rolled finalize_substep above.
+  if (model.substep) {
+    sentence += ` · ${esc(model.substep)}`;
+  }
+
+  // health/work is the slow(er), low-cadence poll (15 s — see refreshHealth
+  // below); paint the sentence/figure as soon as pipeline/stats/setup land
+  // and show a neutral "checking…" status until health catches up.
+  const hasHealth = !!health;
+  const statusKind = !hasHealth ? 'neutral' : (health.status === 'ok' ? 'accent-2' : 'accent');
+  const statusLabel = !hasHealth ? 'checking…' : (health.status === 'ok' ? 'healthy' : health.status);
+  const alerts = hasHealth ? [...(health.critical || []), ...(health.warnings || [])] : [];
+
+  // Only meaningful while a stage is actually live — the gauge/remaining/
+  // finish trio reads "—" (never a fabricated number) otherwise.
+  const isLive = model.currentIndex >= 0 && model.currentIndex < model.stages.length;
+
+  // Owner request #1 — the rate gauge (VU-meter), 0–1000 TIC/min fixed
+  // scale, the loudest number on the page alongside remaining/finish.
+  const gauge = rateGaugeModel(isLive ? model.rateInfo.rate : null);
+
+  // Owner request #3 (kept): total-remaining big number + finish clock — now
+  // the hero's one big figure, with the finish clock riding along as a note.
+  // A stale phase (no fresh signal from the worker/script that owns it) is
+  // NOT the same thing as a phase legitimately estimated at some duration —
+  // say so instead of printing a number nobody should trust.
+  const totalValue = isLive && model.stale ? `no signal for ${fmtDur(model.staleAgeSeconds || 0)}`
+    : isLive && model.totalRemainingSeconds !== null ? fmtDur(model.totalRemainingSeconds) : '—';
+  const finishClock = isLive && !model.stale ? finishClockText(model.totalRemainingSeconds) : null;
+
+  // Owner request #2 (kept): workers alive vs registered.
+  const workers = state.workers ? (state.workers.workers || []) : null;
+  const workersText = workers ? `${fmtInt(workers.filter((w) => w.online).length)} / ${fmtInt(workers.length)}` : '—';
+
+  // Owner request 2026-07-25: how many TICs are left to finish THIS RUN —
+  // the headline sentence says how many are done ("233,966 of 299,944"),
+  // the hero says when it will finish, but never how many were still
+  // outstanding as a number. Derived from the same {done, baseline} pair the
+  // sentence uses, so the two can never disagree (pending+assigned from
+  // health/work would drift from it by the handful of in-flight tasks).
+  const runLeftText = (isLive && model.progress && model.progress.baseline)
+    ? fmtInt(Math.max(0, model.progress.baseline - model.progress.done)) : '—';
+  const runLeftNote = (isLive && model.progress && model.progress.baseline)
+    ? `of ${fmtInt(model.progress.baseline)} in this run` : '';
+
+  const noteBits = [];
+  if (isLive) {
+    const elapsed = elapsedRun(pipeline);
+    if (elapsed !== null) noteBits.push(`running ${fmtDur(elapsed)}`);
+  }
+  noteBits.push(tag(statusLabel, statusKind));
+  // Whatever detail the phase itself chose to say (exonit/progress.py
+  // `message`) — e.g. which host/bucket a backfill is currently on.
+  if (model.message) noteBits.push(esc(model.message));
+
+  heroOverlayEl.innerHTML = `
+    <div class="kicker">Pipeline status</div>
+    <p class="hero-sentence">${sentence}</p>
+    <div class="hero-figure-row">
+      <span class="stat-value hero-figure num">${esc(totalValue)}</span>
+      <span class="stat-note">time remaining${finishClock ? ` · finishes ≈ ${esc(finishClock)}` : ''}</span>
+    </div>
+  `;
+
+  heroDetailEl.innerHTML = `
+    <div class="headline-grid">
+      <div class="gauge">
+        <div class="gauge-head">
+          <span class="kicker">Rate</span>
+          <span class="gauge-value num">${esc(gauge.text)}<span class="gauge-unit">TIC/min</span></span>
+        </div>
+        <div class="gauge-track"><i style="width: ${gauge.widthPct}%"></i><span class="gauge-mid"></span></div>
+        <div class="gauge-ticks"><span>0</span><span>500</span><span>1,000</span></div>
+      </div>
+      <div class="stat-block">
+        <div class="kicker">Workers alive</div>
+        <div class="stat-value num">${esc(workersText)}</div>
+        <div class="stat-note">of registered</div>
+      </div>
+      <div class="stat-block">
+        <div class="kicker">TICs left in run</div>
+        <div class="stat-value num">${esc(runLeftText)}</div>
+        <div class="stat-note">${esc(runLeftNote)}</div>
+      </div>
+    </div>
+    <div class="stat-note">${noteBits.join(' · ')}</div>
+    <div class="stat-note">${fmtInt(stats?.total_stars)} stars analysed ·
+      ${fmtInt(stats?.strong_candidates)} strong candidates</div>
+    ${alerts.length ? `
+      <div class="card card-alert">
+        <div class="facts">
+          ${alerts.map((a) => `<div><span>${humanizeAlert(a)}</span></div>`).join('')}
+        </div>
+      </div>` : ''}
+  `;
+}
+
+// ── Pipeline stages block ─────────────────────────────────────────────────
+// One horizontal row of phase chips (owner request: "a single row with one
+// button per phase and the current phase lit up"), connected by the
+// hairline rail (.steps::before, above) and lit per spec §7: current phase
+// gets the --accent-dim wash + pulsing dot (.step-current, exonit.css);
+// completed phases get a --ok check mark; pending phases stay --ink-mute.
+function renderStepChip(stageKey, kind, timeText) {
+  const label = STAGE_LABELS[stageKey] || stageKey;
+  const nameHtml = kind === 'done'
+    ? `<span class="step-check">${icon('check')}</span>${esc(label)}`
+    : esc(label);
+  return `<div class="step step-${kind}">
+    <div class="step-name">${nameHtml}</div>
+    <div class="step-time">${timeText ? esc(timeText) : ''}</div>
+  </div>`;
+}
+
+// A prior is a median over a handful of past runs: printing it as
+// "59 min 49 s" claims a precision it does not have (and makes a column of
+// estimates hard to scan). Round to the granularity the number deserves.
+function fmtEstimate(seconds) {
+  const rounded = seconds < 600 ? Math.round(seconds / 60) * 60
+    : seconds < 3600 ? Math.round(seconds / 300) * 300
+      : Math.round(seconds / 600) * 600;
+  // fmtDur always prints the minutes field past an hour ("1 h 0 min"); once
+  // rounded to the nearest 10 min a trailing zero is just noise.
+  return fmtDur(rounded).replace(/ 0 min$/, '');
+}
+
+function estimateText(stageKey, lot, priors) {
+  const est = priorEstimateSeconds(priors, stageKey, lot);
+  if (est === null) return null;
+  return est < 45 ? 'under a minute typically' : `≈ ${fmtEstimate(est)} typical`;
+}
+
+function renderPipeline() {
+  const pipeline = state.pipeline;
+  if (!pipeline) return;
+  const model = computeRunModel();
+  const { stages, currentIndex, progress, etaCurrentSeconds, lot } = model;
+
+  const chips = stages.map((stageKey, i) => {
+    if (currentIndex >= 0 && i < currentIndex) {
+      // Past phase (done): no per-phase actual-duration history is recorded
+      // server-side, so there is no real elapsed time to show — per spec,
+      // nothing is better than a fabricated number.
+      return renderStepChip(stageKey, 'done', '');
+    }
+    if (i === currentIndex) {
+      let timeText = etaCurrentSeconds !== null ? `${fmtDur(etaCurrentSeconds)} left` : '—';
+      if (progress && progress.baseline) {
+        timeText = `${fmtInt(progress.done)} / ${fmtInt(progress.baseline)} · ${timeText}`;
+      }
+      return renderStepChip(stageKey, 'current', timeText);
+    }
+    const est = estimateText(stageKey, lot, state.priors);
+    const depth = pendingQueueDepth(stageKey, state.health);
+    const timeText = est || (depth != null ? `${fmtInt(depth)} waiting` : '');
+    return renderStepChip(stageKey, 'pending', timeText);
+  }).join('');
+
+  const validated = state.nfpp ? state.nfpp.validated : null;
+  const footerBits = [`Non-transit backfill: ${fmtInt(validated)} candidates validated so far.`];
+  if (state.priors && state.priors.generated_at) {
+    footerBits.push(`Estimates for phases that have not started come from the last runs ` +
+      `(updated ${fmtPriorsDate(state.priors.generated_at)}).`);
+  } else if (state.priorsAttempted) {
+    footerBits.push('Phase-duration estimates are unavailable for phases that have not started yet.');
+  }
+
+  pipelineBodyEl.innerHTML = `<div class="steps">${chips}</div>
+    <p class="text-muted">${footerBits.join(' ')}</p>`;
+}
+
+// ── Sector completion (owner request #4) ──────────────────────────────────
+// Reuses the /api/discovery/sectors payload already fetched by loadSectors()
+// for the toolbar's sector <select> — no new request. Same .track row
+// grammar as the rest of the app.
+function renderSectorCompletion() {
+  const d = state.sectorsData;
+  if (!d) return;
+  const sector = (d.sectors || []).find((s) => s.number === d.active_sector);
+  if (!sector) {
+    sectorBodyEl.innerHTML = '<p class="text-muted">No active sector.</p>';
+    return;
+  }
+  const examined = sector.examined || 0;
+  // Same number as the Completion page (its sectorFrac): prefer the
+  // server-computed pct_complete — real per-TIC completion (completed +
+  // no_data over the work list, history included; background-refreshed
+  // ~30 min, including closed sectors since 2026-10-05). `examined` is the
+  // sequential enqueue cursor and undercounts sectors whose coverage
+  // advanced outside that path (s2: cursor ~27% vs real 70.8%), so it is
+  // only a fallback while pct_complete is not computed yet, and is labelled
+  // as enqueue progress when shown.
+  //
+  // Denominator — MUST mirror the server's own pct_complete formula
+  // (exonit/routes/discovery.py's `download_complete` rule) exactly, or
+  // this number and the % it labels disagree:
+  //   - pct_complete not computed yet: total_tics (enqueue-progress fallback,
+  //     same as before).
+  //   - Download verifiably complete (downloaded >= total_tics, both known
+  //     and positive): work_list_size alone — total_tics is a stale/
+  //     unreliable FITS-file count once nothing is left to download
+  //     (2026-10-05).
+  //   - Otherwise (still mid-download, or total_tics/downloaded unknown):
+  //     max(total_tics, work_list_size) — the pre-2026-10-05 safety net, so
+  //     an open sector still receiving bulk downloads does not overstate
+  //     progress against its not-yet-fully-downloaded work list (the
+  //     historical "sector 23 shows 54% instead of ~24%" bug).
+  const hasPct = sector.pct_complete != null;
+  const downloadComplete = hasPct && sector.total_tics > 0 && sector.downloaded > 0
+    && sector.downloaded >= sector.total_tics;
+  const pctDenom = downloadComplete
+    ? (sector.work_list_size > 0 ? sector.work_list_size : sector.total_tics)
+    : Math.max(sector.total_tics || 0, sector.work_list_size || 0);
+  const fallbackDenom = sector.total_tics > 0 ? sector.total_tics : sector.work_list_size;
+  const denom = hasPct ? pctDenom : fallbackDenom;
+  const frac = hasPct
+    ? Math.min(1, sector.pct_complete)
+    : (denom ? Math.min(1, examined / denom) : null);
+  const pctVal = frac !== null ? Math.round(frac * 1000) / 10 : null;
+  const done = hasPct ? Math.round(frac * denom) : examined;
+  // "left" prefers the server's own gaps_processable (exact remaining-work
+  // count) over denom - done (which can be off by the tois_skipped/
+  // failed_terminal terms pct_complete folds in but done/denom don't).
+  const remaining = (hasPct && sector.gaps_processable != null)
+    ? sector.gaps_processable
+    : Math.max(0, denom - done);
+  const countsText = denom
+    ? `${fmtInt(done)} / ${fmtInt(denom)} · ${fmtInt(remaining)} left${hasPct ? '' : ' (enqueued)'}`
+    : 'work list size not known yet';
+  const width = pctVal !== null ? pctVal : 0;
+  sectorBodyEl.innerHTML = `<div class="track">
+    <div>
+      <div class="track-name"><strong>Sector ${esc(sector.number)}</strong><span>${esc(countsText)}</span></div>
+      <span class="bar${pctVal === 100 ? ' bar-done' : ''}" style="margin-top: var(--sp-2)"><i style="width: ${width}%"></i></span>
+    </div>
+    <div class="track-pct">${pctVal !== null ? fmtPct(pctVal / 100) : '—'}</div>
+  </div>`;
+}
+
+// ── State + independent per-block polls ───────────────────────────────────
+// Cadences (spec "Performance"): the live server measured /api/stats 4.6s,
+// /api/backfill/fpp 4.2s, /api/backfill/nfpp 3.6s, /api/worker/list 1.0s,
+// /api/health/work (cached) 0.1s, /api/discovery/pipeline 0.01s. The old
+// page polled the 4s endpoints every 5-10s and saturated the server —
+// panels sat on "Loading…" forever. /api/backfill/fpp is DROPPED entirely:
+// every number it fed the page is already in /api/health/work's
+// fpp_backfill block.
+const heroOverlayEl = document.getElementById('heroOverlay');
+const heroDetailEl = document.getElementById('heroDetail');
+const pipelineBodyEl = document.getElementById('pipelineBody');
+const sectorBodyEl = document.getElementById('sectorBody');
+
+const state = {
+  pipeline: null, stats: null, setup: null,
+  health: null, nfpp: null, workers: null,
+  priors: null, priorsAttempted: false, sectorsData: null,
+};
+
+// Baseline "floor" for the three server-reported {done, baseline} pairs —
+// defends against /api/health/work's 10s cache (keyed WITHOUT run_id)
+// occasionally serving a scoped request the global payload, which would
+// otherwise make 'done' jump backwards (spec "the stale/scope guard").
+const doneFloor = { primary_tasks: null, exominer_backfill: null, lora_explanation: null };
+
+function paintHeadline() { renderHeadline(); }
+function paintPipeline() { renderPipeline(); }
+
+// Fast poll: pipeline state only (~10ms) — everything else has its own cadence.
+async function refreshFast() {
+  const p = await getJSON('/api/discovery/pipeline');
+  if (state.pipeline && state.pipeline.run_id !== p.run_id) {
+    // New run: the per-run floors/baselines above belong to the old run_id
+    // and would otherwise clamp the new run's numbers to a stale value.
+    doneFloor.primary_tasks = null;
+    doneFloor.exominer_backfill = null;
+    doneFloor.lora_explanation = null;
+  }
+  state.pipeline = p;
+  paintHeadline();
+  paintPipeline();
+}
+
+// Stats/setup: the two ~1-5s PG aggregates the headline needs, at their own
+// slower cadence so they never gate the pipeline sentence.
+async function refreshStats() {
+  const [stats, setup] = await Promise.all([
+    getJSON('/api/stats'),
+    getJSON('/api/setup/status'),
+  ]);
+  state.stats = stats;
+  state.setup = setup;
+  paintHeadline();
+}
+
+// Workers alive/registered feeds both the hero detail grid and the nav's
+// live worker count/dot (spec §4: "worker counter the page already
+// gets from /api/worker/list").
+async function refreshWorkers() {
+  state.workers = await getJSON('/api/worker/list');
+  paintHeadline();
+  renderNavLive();
+}
+
+// The expensive one: health/work, scoped to the active run_id when known.
+async function refreshHealth() {
+  const pipeline = state.pipeline;
+  const runId = pipeline && pipeline.run_id;
+  const url = runId ? `/api/health/work?run_id=${encodeURIComponent(runId)}` : '/api/health/work';
+  const payload = await getJSON(url);
+
+  if (runId) {
+    const scoped = payload && payload.scope && payload.scope.scoped === true;
+    if (!scoped) {
+      // Stale-scope guard: discard rather than repaint with a different
+      // scope's numbers — keep the previous good snapshot untouched.
+      return;
+    }
+  }
+
+  for (const key of ['primary_tasks', 'exominer_backfill', 'lora_explanation']) {
+    const block = payload[key];
+    if (!block || block.baseline == null || block.done == null) continue;
+    const floor = doneFloor[key];
+    if (floor && floor.baseline === block.baseline && block.done < floor.done) {
+      block.done = floor.done;
+    } else {
+      doneFloor[key] = { baseline: block.baseline, done: block.done };
+    }
+  }
+
+  state.health = payload;
+  paintHeadline();
+  paintPipeline();
+}
+
+// Non-transit FPP backfill — kept only for the pipeline footer's "candidates
+// validated so far" line (spec: drop /api/backfill/fpp entirely).
+async function refreshBackfillNfpp() {
+  state.nfpp = await getJSON('/api/backfill/nfpp');
+  paintPipeline();
+}
+
+// Phase-duration priors: loaded once, then refreshed every 30 min. Never
+// throws the page over a 404/parse failure — degrades to null and the hero/
+// pipeline mark the total remaining and the estimate column as "—".
+async function refreshPriors() {
+  try {
+    state.priors = await getJSON('/static/phase_timings.json');
+  } catch {
+    state.priors = null;
+  } finally {
+    state.priorsAttempted = true;
+    paintHeadline();
+    paintPipeline();
+  }
+}
+
+const fastPoll = poll(refreshFast, 5000);
+poll(refreshStats, 60000);
+poll(refreshWorkers, 15000);
+poll(refreshBackfillNfpp, 120000);
+poll(refreshPriors, 30 * 60 * 1000);
+// Don't fire the first health/work until the pipeline state has landed:
+// poll() calls its fn immediately, and without a run_id the endpoint falls
+// back to the global aggregate — that first blind call was what made every
+// arrival on this page feel slow (project gotcha:
+// gotcha_healthwork_global_counter_hangs_run).
+(async () => {
+  try { await refreshFast(); } catch { /* hero shows its own error */ }
+  poll(refreshHealth, 15000);
+})();
+staleNote(document.getElementById('staleNote'), fastPoll);
+
+// Ticking clock (owner request #4, "the primary-run bar did not update"):
+// re-render the hero and pipeline from cached state once a second — local
+// recompute only, no fetch — so the big ETA number, the "finishes ≈" clock
+// and the per-stage bars count down smoothly instead of sitting frozen for
+// a whole poll interval.
+setInterval(() => {
+  if (state.pipeline) {
+    paintHeadline();
+    paintPipeline();
+  }
+}, 1000);
+
+// After an action that changes pipeline/worker/backfill state (scan start,
+// stats reset), refresh every block right away instead of waiting out its
+// own cadence — each still paints independently as its response lands.
+function refreshAllNow() {
+  refreshFast();
+  refreshStats();
+  refreshWorkers();
+  refreshHealth();
+  refreshBackfillNfpp();
+}
+
+// ── Nav — live worker count + FX toggle (spec §4) ─────────────────────────
+const navLiveDotEl = document.getElementById('navLiveDot');
+const navLiveCountEl = document.getElementById('navLiveCount');
+const fxToggleEl = document.getElementById('fxToggle');
+
+function renderNavLive() {
+  const workers = state.workers ? (state.workers.workers || []) : null;
+  if (!workers) return;
+  const online = workers.filter((w) => w.online).length;
+  navLiveCountEl.textContent = `${fmtInt(online)} worker${online === 1 ? '' : 's'}`;
+  navLiveDotEl.classList.toggle('is-down', online === 0);
+}
+
+fxToggleEl.textContent = fxEnabled() ? 'FX on' : 'FX off';
+fxToggleEl.addEventListener('click', toggleFx);
+// A <span data-fx-toggle> (spec's own shell markup) isn't natively
+// keyboard-operable — role="button" + tabindex="0" in the markup plus this
+// handler make it one, without inventing a second toggle mechanism.
+fxToggleEl.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleFx(); }
+});
+
+// ── Hero: three.js scene + the light-curve signature (spec §3, §6.1) ─────
+const heroCanvasEl = document.getElementById('heroCanvas');
+const heroSceneWrapEl = document.getElementById('heroSceneWrap');
+const lightcurveWrapEl = document.getElementById('lightcurveWrap');
+const lightcurvePathEl = document.getElementById('lightcurvePath');
+const lightcurvePointEl = document.getElementById('lightcurvePoint');
+
+// Synthetic flux-vs-phase curve for the SVG (decorative-narrative, not real
+// data — spec §6.1: "NO tooltip; it is aria-hidden"). A raised-cosine
+// dip, symmetric around the transit. viewBox is 800×100 user units.
+const LC_W = 800, LC_BASE_Y = 22, LC_DEPTH = 46, LC_HALF_WIDTH = 0.09;
+
+function transitDepth(u) {
+  const dist = Math.abs(u - 0.5);
+  if (dist >= LC_HALF_WIDTH) return 0;
+  return 0.5 * (1 + Math.cos((Math.PI * dist) / LC_HALF_WIDTH));
+}
+function fluxY(u) { return LC_BASE_Y + LC_DEPTH * transitDepth(u); }
+function buildLightCurvePath() {
+  const steps = 160;
+  const pts = [];
+  for (let i = 0; i <= steps; i++) {
+    const u = i / steps;
+    pts.push(`${i === 0 ? 'M' : 'L'}${(u * LC_W).toFixed(1)} ${fluxY(u).toFixed(1)}`);
+  }
+  return pts.join(' ');
+}
+// setTransitPhase(cb) fires cb(t) once per rendered frame; t=0 is
+// mid-transit (scene.js docstring). The SVG's phase axis is re-centered so
+// that moment lands mid-curve: u = (t + 0.5) % 1 — the dot starts at the
+// left edge (out of transit), dips at the middle, wraps at the right edge.
+function onTransitPhase(t) {
+  const u = (t + 0.5) % 1;
+  lightcurvePointEl.setAttribute('cx', (u * LC_W).toFixed(1));
+  lightcurvePointEl.setAttribute('cy', fluxY(u).toFixed(1));
+}
+
+const heroHandle = initScene(heroCanvasEl, { mode: 'hero' });
+if (heroCanvasEl.hidden) {
+  // FX off / no WebGL: initScene() already hid the canvas and returned a
+  // no-op handle that never calls onTransitPhase (spec §0.3). Per the task
+  // brief: the hero block then shows only the headline over the page's
+  // static CSS starfield fallback — no empty 380px box, no dead light curve.
+  heroSceneWrapEl.classList.add('is-inert');
+  lightcurveWrapEl.hidden = true;
+} else {
+  lightcurvePathEl.setAttribute('d', buildLightCurvePath());
+  heroHandle.setTransitPhase(onTransitPhase);
+}
+
+// ── Toolbar controls (unchanged behaviour) ────────────────────────────────
+const sectorSel = document.getElementById('scanSector');
+const countInput = document.getElementById('scanCount');
+const btnScan = document.getElementById('btnScan');
+const btnAutofillStart = document.getElementById('btnAutofillStart');
+const btnAutofillStop = document.getElementById('btnAutofillStop');
+const btnStartWorkers = document.getElementById('btnStartWorkers');
+const btnResetStats = document.getElementById('btnResetStats');
+const toolbarMsgEl = document.getElementById('toolbarMsg');
+
+function setToolbarMsg(html, isAlert) {
+  toolbarMsgEl.innerHTML = !html ? '' : (isAlert
+    ? `<div class="card card-alert"><div class="facts"><div><span>${html}</span></div></div></div>`
+    : `<p class="text-muted">${html}</p>`);
+}
+
+// Sector select: preserves the user's current pick across refreshes
+// (re-snapping to active_sector on every poll fought a manual selection —
+// see the equivalent comment in the legacy page).
+async function loadSectors() {
+  const d = await getJSON('/api/discovery/sectors');
+  state.sectorsData = d; // also feeds the sector-completion row — no second request
+  const sectors = d.sectors || [];
+  const activeSector = d.active_sector || 1;
+  const prevValue = sectorSel.value;
+  const selected = (prevValue !== '' && sectors.some((s) => String(s.number) === prevValue))
+    ? parseInt(prevValue, 10)
+    : activeSector;
+
+  sectorSel.innerHTML = sectors.length ? sectors.map((s) => {
+    const st = s.state || (s.enabled ? 'active' : 'coming_soon');
+    const label = st === 'complete' ? `Sector ${s.number} (complete)`
+      : st === 'coming_soon' ? `Sector ${s.number} (coming soon)`
+      : `Sector ${s.number}`;
+    return `<option value="${s.number}" ${st === 'coming_soon' ? 'disabled' : ''}
+      ${s.number === selected ? 'selected' : ''}>${esc(label)}</option>`;
+  }).join('') : `<option value="1" selected>Sector 1</option>`;
+
+  renderSectorCompletion();
+}
+poll(loadSectors, 60000);
+
+async function startScan() {
+  setToolbarMsg('', false);
+  const sector = parseInt(sectorSel.value, 10) || 1;
+  const count = parseInt(countInput.value, 10) || 100000;
+  btnScan.disabled = true;
+  try {
+    // Raw fetch (not postJSON): the need_download 409 carries missing/
+    // requested/ready/hint fields that postJSON's generic error collapsing
+    // would discard — this endpoint's edge cases are explicitly inventoried.
+    const res = await fetch('/api/discovery/scan', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ sector, count }),
+    });
+    const d = await res.json().catch(() => ({}));
+    if (res.ok && (d.status === 'started' || d.status === 'dry_run')) {
+      setToolbarMsg(`Scan started — sector ${sector}, up to ${fmtInt(count)} TICs` +
+        (d.status === 'dry_run' ? ' (dry run).' : '.'), false);
+      refreshAllNow();
+    } else if (res.status === 409 && d.status === 'need_download') {
+      setToolbarMsg(`Not enough data downloaded: ${fmtInt(d.missing)} TICs missing
+        (requested ${fmtInt(d.requested)}, ${fmtInt(d.ready)} ready).
+        ${esc(d.hint || '')} <a href="/downloads">Go to Downloads</a>.`, true);
+    } else if (res.status === 409 && d.status === 'already_running') {
+      setToolbarMsg(`A discovery run is already in progress (${esc(pipeLabel(d.state))}).`, true);
+    } else {
+      setToolbarMsg(`Scan failed: ${esc(d.detail || d.error || d.status || res.statusText)}`, true);
+    }
+  } catch (e) {
+    setToolbarMsg(`Network error: ${esc(e.message)}`, true);
+  } finally {
+    btnScan.disabled = false;
+  }
+}
+
+async function autofillSector(action) {
+  const sector = parseInt(sectorSel.value, 10) || 1;
+  const btn = action === 'start' ? btnAutofillStart : btnAutofillStop;
+  btn.disabled = true;
+  try {
+    const d = await postJSON(`/api/discovery/sector/${sector}/autofill`, { action });
+    setToolbarMsg(`Sector ${sector} auto-fill: ${esc(d.status || 'ok')}.`, false);
+    loadSectors();
+  } catch (e) {
+    setToolbarMsg(`Error: ${esc(e.message)}`, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function startWorkers() {
+  btnStartWorkers.disabled = true;
+  setToolbarMsg('Sending start signal to workers…', false);
+  try {
+    const results = await postJSON('/api/workers/start', {});
+    const failed = results.filter((r) => r.action === 'failed');
+    const summary = results.map((r) => `${esc(r.worker)}: ${esc(r.action)}`).join(' · ');
+    setToolbarMsg(summary || 'No workers configured.', failed.length > 0);
+  } catch (e) {
+    setToolbarMsg(`Error: ${esc(e.message)}`, true);
+  } finally {
+    btnStartWorkers.disabled = false;
+  }
+}
+
+async function resetStats() {
+  if (!confirm('Reset all progress baselines and worker stats? ' +
+    'Candidate and star data in the database is not affected.')) return;
+  btnResetStats.disabled = true;
+  try {
+    await postJSON('/api/admin/reset_all', {});
+    setToolbarMsg('Baselines and worker stats reset.', false);
+    refreshAllNow();
+  } catch (e) {
+    setToolbarMsg(`Error: ${esc(e.message)}`, true);
+  } finally {
+    btnResetStats.disabled = false;
+  }
+}
+
+btnScan.addEventListener('click', startScan);
+btnAutofillStart.addEventListener('click', () => autofillSector('start'));
+btnAutofillStop.addEventListener('click', () => autofillSector('stop'));
+btnStartWorkers.addEventListener('click', startWorkers);
+btnResetStats.addEventListener('click', resetStats);
+
+// ── Deployment gating: AWS deployments manage their fleet from /aws ──────
+(async () => {
+  try {
+    const d = await getJSON('/api/deployment');
+    if (d.deployment === 'aws') {
+      btnStartWorkers.remove();
+      const hint = document.createElement('p');
+      hint.className = 'text-muted toolbar-msg';
+      hint.textContent = 'Deployed on AWS — worker fleet is managed via the AWS API (UI page removed 2026-08-17).';
+      document.getElementById('toolbar').appendChild(hint);
+    }
+  } catch { /* deployment endpoint unreachable — home behaviour stays default */ }
+})();
+</script>
+
+</body>
+</html>

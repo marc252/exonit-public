@@ -1,0 +1,19 @@
+numpy
+scipy
+requests
+onnxruntime
+lightkurve>=2.4
+astroquery
+pandas
+numba
+psutil
+wotan>=1.10
+pydl>=1.0             # kepler_spline (detrend) dep — bspline/robust_mean
+
+# GPU acceleration (optional — install manually per platform)
+# NVIDIA: pip install cupy-cuda12x onnxruntime-gpu
+# Apple Silicon: pip install mlx
+# Intel GPU: pip install pyopencl
+
+# Terminal UI (optional -- plain text fallback if not installed)
+# pip install rich

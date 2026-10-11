@@ -1,0 +1,78 @@
+# ExoNit PostgreSQL tuning example (PostgreSQL 18, 32 GB host, NVMe storage).
+#
+# Install as a drop-in, e.g. /etc/postgresql/18/main/conf.d/10-exonit-tuning.conf, then
+# restart PostgreSQL (shared_preload_libraries, shared_buffers, max_connections, huge_pages
+# and max_worker_processes only change on restart). Rollback: rename the file to .off and restart.
+# These values come from the reference deployment (64 GB host) scaled to 32 GB; treat them as a
+# starting point and measure with pg_stat_statements before changing them further.
+
+# --- Observability (restart) ---
+# pg_stat_statements: per-statement timings, the first tool to reach for when something is slow.
+shared_preload_libraries = 'pg_stat_statements'
+pg_stat_statements.max = 5000
+pg_stat_statements.track = top
+pg_stat_statements.track_utility = on
+pg_stat_statements.save = on
+# Long ExoNit queries (big IN lists, CTEs) get truncated at the 1 kB default.
+track_activity_query_size = 4096
+track_io_timing = on
+track_wal_io_timing = on
+
+# --- Memory (restart) ---
+# 4 GB is enough: reads that miss shared_buffers are served by the Linux page cache (~0.1-0.5 us
+# per block vs ~50-100 us on NVMe), and the page cache is reclaimable under pressure while
+# shared_buffers is not. Measured: 12 GB gave no gain on the reference host.
+shared_buffers = 4GB
+# Use huge pages when the OS has them reserved; fall back silently otherwise.
+huge_pages = try
+# Large WAL buffer for the bulk-insert bursts of a scan phase.
+wal_buffers = 64MB
+# Server (4 uvicorn processes) + workers + orchestrator + compaction need well above the default 100.
+max_connections = 150
+max_worker_processes = 16
+# Completeness / task tables are partitioned; the default 64 locks per transaction is too low.
+max_locks_per_transaction = 128
+# CREATE INDEX / VACUUM / compaction memory.
+maintenance_work_mem = 1GB
+autovacuum_work_mem = 256MB
+# Planner hint only (not an allocation): roughly the RAM the OS can use as page cache.
+# Reference host: 16 GB of 64; keep about 50% of RAM on a 32 GB host.
+effective_cache_size = 16GB
+
+# --- I/O (NVMe) ---
+# SSD/NVMe can serve many concurrent requests; these are the usual NVMe values.
+effective_io_concurrency = 200
+maintenance_io_concurrency = 200
+# PostgreSQL 18 asynchronous I/O worker processes.
+io_workers = 6
+
+# --- Checkpoints / WAL ---
+# Bulk loads produced a checkpoint storm (one every ~4 s) with the defaults.
+checkpoint_timeout = 15min
+max_wal_size = 8GB
+min_wal_size = 2GB
+# Full-page images dominated WAL volume; lz4 compresses them cheaply.
+wal_compression = lz4
+bgwriter_lru_maxpages = 1000
+bgwriter_delay = 100ms
+
+# --- Autovacuum (global values; tune per table with ALTER TABLE) ---
+autovacuum_max_workers = 4
+autovacuum_vacuum_cost_limit = 1000
+# Tables with hundreds of millions of rows: vacuum/analyze much earlier than the 20%/10% defaults.
+autovacuum_vacuum_scale_factor = 0.05
+autovacuum_analyze_scale_factor = 0.02
+autovacuum_vacuum_insert_scale_factor = 0.1
+
+# --- Logging ---
+# Log statements slower than 2 s, temp files above 100 MB, lock waits and slow autovacuums.
+log_min_duration_statement = 2000
+log_temp_files = 100MB
+log_lock_waits = on
+log_autovacuum_min_duration = 1min
+
+# --- Keepalives (server side, mirrors the client-side keepalives in exonit/) ---
+# Detect dead worker connections in ~90 s instead of the 2 h kernel default.
+tcp_keepalives_idle = 60
+tcp_keepalives_interval = 10
+tcp_keepalives_count = 3

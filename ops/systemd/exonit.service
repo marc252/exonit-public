@@ -1,0 +1,33 @@
+# ExoNit pipeline server (FastAPI/uvicorn, multi-process, Redis-backed).
+#
+# Install:
+#   sudo useradd --system --create-home --home-dir /opt/exonit exonit   # once
+#   sudo cp ops/systemd/exonit.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now exonit.service
+#
+# /opt/exonit/.env is the single source of production configuration (see .env.example).
+# To restart the production server without leaving systemd in "deactivating":
+#   sudo kill -9 $(systemctl show -p MainPID --value exonit.service)   # Restart=on-failure brings it back
+# Do NOT restart it while a discovery lot is running: the orchestrator lives in this cgroup.
+
+[Unit]
+Description=ExoNit Pipeline Server
+After=network.target postgresql.service redis-server.service
+
+[Service]
+Type=simple
+User=exonit
+WorkingDirectory=/opt/exonit
+ExecStart=/opt/exonit/.venv-server/bin/python run_nightly.py serve --workers 4
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=/opt/exonit/.env
+# Soft memory ceiling: reclaim aggressively above this instead of OOM-killing.
+# Example sized for a 64 GB server (measured peak is well below it); scale it with your RAM.
+MemoryHigh=32G
+# A new uvicorn worker opening many connections against a backlog needs more than the
+# default soft limit of 1024 open files (it fails with Errno 24).
+LimitNOFILE=524288:524288
+
+[Install]
+WantedBy=multi-user.target

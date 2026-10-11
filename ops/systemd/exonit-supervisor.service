@@ -1,0 +1,40 @@
+# Reference unit for the ExoNit autonomy supervisor (armed mode).
+#
+# DO NOT install (copy to /etc/systemd/system/ or `systemctl enable`) until you have
+# validated the autonomous-run checklist described in docs/running-a-campaign.md (section "The optional supervisor").
+# This unit starts with `--armed`; armed mode only takes effect for real when BOTH keys are
+# present: `armed: true` in data/autonomy/config.yaml AND EXONIT_AUTONOMY_ARMED=1 in the
+# environment (set below via `Environment=`). Without both, the supervisor falls back to
+# shadow mode (read-only, no execution) and logs a clear warning. That fallback is a safety
+# brake, not a licence to deploy this unit unreviewed.
+#
+# Once the checklist is closed:
+#   sudo cp ops/systemd/exonit-supervisor.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now exonit-supervisor.service
+#
+# EnvironmentFile has no leading dash on purpose: it is required. Armed mode needs the same
+# .env as exonit.service (EXONIT_DATABASE_URL, EXONIT_FARMCTL_ALLOW_START, ...) for the
+# subprocesses it launches (health check, farmctl, lot close-out). If the file is missing the
+# service fails at start instead of silently falling back to wrong defaults.
+
+[Unit]
+Description=ExoNit Autonomy Supervisor (armed mode - do not install before validating the checklist)
+After=network.target exonit.service
+
+[Service]
+Type=simple
+User=exonit
+WorkingDirectory=/opt/exonit
+ExecStart=/opt/exonit/.venv-server/bin/python -m autonomy.supervisor --armed
+Environment=EXONIT_AUTONOMY_ARMED=1
+EnvironmentFile=/opt/exonit/.env
+# KillMode=process so that a restart/crash of the supervisor does NOT kill the orchestrator
+# that the resume_run playbook launched detached (start_new_session); with the default
+# control-group mode the whole cgroup would die.
+KillMode=process
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

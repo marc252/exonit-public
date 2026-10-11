@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "generated_by": {
+    "coremltools": "8.3.0",
+    "torch": "2.5.0",
+    "onnx": "1.17.0",
+    "conversion_script": "scripts/convert_onnx_coreml.py"
+  },
+  "models": {
+    "cnn_ffi_v1": {
+      "source_onnx_sha256": "564219bde57452d793efe28656e99555d57bfa3e50eac6e55d417f18a6fd6ad4",
+      "source_onnx_data_sha256": "58e6f5ebed9ca0b7bb050d4d530b15929d2b3e45c0fff83615c4c58d75c526b1",
+      "deterministic_package_sha256": "c0bc22b1922a1f03459e008838e08b278b93bfe11bdf38ba815468365f83b196",
+      "package_files_sha256": {
+        "Data/com.apple.CoreML/model.mlmodel": "4ad1e7b741920ae9b01cd2ab1744923af26dbbff275361d1ffb85c3aa3817c0a",
+        "Data/com.apple.CoreML/weights/weight.bin": "4cdba7cce80cdb7fa51e2ae342974743072cb24544016099e7778e6705a7d591",
+        "Manifest.json": "b829afc0455c045508434227919764e5ab1f7a13b307fe4c17c6dd606d124da3"
+      },
+      "inputs": {
+        "global_view": [1, 1, 201],
+        "local_view": [1, 1, 61]
+      },
+      "output_name": "var_176",
+      "output_semantics": "logit",
+      "probability_transform": "sigmoid(clamp(logit,-60,60))",
+      "golden_max_abs_tolerance": 0.00002,
+      "measured_synthetic_coreml_max_abs": 0.000000059604644775390625
+    },
+    "exominer_ffi_v6_ensemble": {
+      "source_onnx_sha256": "38c031111a1720e49ff10bec326447b84d9d2a1d038e323e7f47e24f1445d291",
+      "source_onnx_data_sha256": "bb188aff011f90e2d6c7d798518fec7dad39a22bcd2a2fb2da53120e0df2fc7b",
+      "deterministic_package_sha256": "73f25d1d5e5e630bfa45036fa54ace147dcbae724cda84c3998ad5bff97fe894",
+      "package_files_sha256": {
+        "Data/com.apple.CoreML/model.mlmodel": "1d155000d1f116848a20e842e30c3cc9daefe110e69250c39099a89a2c35fba3",
+        "Data/com.apple.CoreML/weights/weight.bin": "a44d652e6479ba25ab6be2199cb5f7f14bcacfd5f3959fa3a54b5eafa6a7cb24",
+        "Manifest.json": "16a02b3c58dc706d2757553a0b12acb92bb79bb6a7323f3bf3b65329ff9a5532"
+      },
+      "inputs": {
+        "global_view": [1, 1, 201],
+        "local_view": [1, 1, 61],
+        "centroid_view": [1, 1, 61],
+        "centroid_mask": [1, 1],
+        "stellar": [1, 5],
+        "tce": [1, 4],
+        "aux_views": [1, 3, 61]
+      },
+      "output_name": "var_586",
+      "output_semantics": "logit",
+      "model_version": "phase3_v6_ensemble_cal",
+      "calibration": {
+        "kind": "piecewise_linear",
+        "sha256": "dbc248b3287a308fb89f6732ff3394e5c38953185a1f0ff0b58e70c69f714ef7",
+        "x": [0.0, 0.38930313157914914, 1.0],
+        "y": [0.0, 0.5, 1.0]
+      },
+      "golden_max_abs_tolerance": 0.00002,
+      "measured_synthetic_coreml_max_abs": 0.00000020116567611694336
+    }
+  }
+}

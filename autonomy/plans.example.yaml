@@ -1,0 +1,35 @@
+# autonomy/plans.example.yaml
+#
+# Plan queue of the ExoNit autonomy subsystem (phase 1 — shadow mode).
+# Copy this file (e.g. to data/autonomy/plans.yaml or wherever the
+# runbook says) and adjust it. See spec §4.1 and §4.6.
+#
+# IMPORTANT: a plan without `approved_by` is loaded anyway but NEVER
+# executed — the supervisor touches nothing the operator has not approved.
+
+# Ordered master list of sectors (continuity policy, §4.6): when the
+# `plans` queue runs out with no approved successor, the system picks
+# the next sector from this list on its own (if it passes the space gate) in
+# survey mode with default parameters.
+master_list: [15, 16, 17]
+
+plans:
+  - plan_id: s0015-survey-2026-08-20
+    approved_by: operator    # the supervisor does NOT execute plans without this field
+    sector: 15
+    mode: survey             # survey | deep_rescan
+    worklist: null           # or a CSV for deep_rescan
+    lot_size: 300000
+    max_lots: null           # null = until the sector is exhausted
+    fleet_profile: full      # full | reduced (see §7)
+    notes: "rationale for the choice (approved summary)"
+
+  - plan_id: s0016-survey-2026-09-03  # next one, already approved: transition with no gap
+    approved_by: operator
+    sector: 16
+    mode: survey
+    worklist: null
+    lot_size: 300000
+    max_lots: null
+    fleet_profile: full
+    notes: "continuation of the campaign, next sector from master_list"

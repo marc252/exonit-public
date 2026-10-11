@@ -1,0 +1,47 @@
+{
+  "task_id": "task_254113311_001",
+  "tic_id": "254113311",
+  "ra": 195.123,
+  "dec": -45.678,
+  "tmag": 11.2,
+  "n_sectors": 3,
+  "n_points": 58000,
+  "time_span_days": 1850.0,
+  "candidates": [],
+  "cnn_scores": [],
+  "completeness": {
+    "details": [
+      {"radius_earth": 1.0, "period_days": 1.0, "detection_prob": 0.45},
+      {"radius_earth": 1.0, "period_days": 5.0, "detection_prob": 0.20},
+      {"radius_earth": 2.0, "period_days": 1.0, "detection_prob": 0.82},
+      {"radius_earth": 2.0, "period_days": 5.0, "detection_prob": 0.55},
+      {"radius_earth": 4.0, "period_days": 1.0, "detection_prob": 0.95},
+      {"radius_earth": 4.0, "period_days": 5.0, "detection_prob": 0.78},
+      {"radius_earth": 4.0, "period_days": 10.0, "detection_prob": 0.50},
+      {"radius_earth": 4.0, "period_days": 20.0, "detection_prob": 0.30},
+      {"radius_earth": 8.0, "period_days": 1.0, "detection_prob": 0.99},
+      {"radius_earth": 8.0, "period_days": 5.0, "detection_prob": 0.92},
+      {"radius_earth": 8.0, "period_days": 10.0, "detection_prob": 0.75},
+      {"radius_earth": 8.0, "period_days": 20.0, "detection_prob": 0.48}
+    ]
+  },
+  "processing_time_seconds": 120.5,
+  "gpu_used": true,
+  "timings": {
+    "load": 1.8,
+    "bls": 12.0,
+    "vetting": 0.0,
+    "cnn": 0.0,
+    "injection": 100.0,
+    "total": 120.5,
+    "gpu_backend": "cuda",
+    "n_candidates": 0
+  },
+  "_meta": {
+    "generated_at": "2026-04-15T12:00:00Z",
+    "generator_version": "v0.2.0",
+    "source": "golden_fixture_tic_254113311",
+    "note": "Sectors 27,67,94 — anti-fill_gaps reference",
+    "sectors": [27, 67, 94]
+  }
+}

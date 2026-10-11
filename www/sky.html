@@ -1,0 +1,934 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ExoNit — Sky</title>
+<link rel="stylesheet" href="/static/exonit.css">
+</head>
+<body>
+<!-- No #bgScene here, deliberately: every other page uses scene.js's ambient
+     starfield as chrome behind the content. This page's three.js scene IS
+     the content (spec §7), so it would be redundant/wasteful to also run an
+     ambient field behind it. `fxEnabled`/`toggleFx` are still imported from
+     scene.js below (www/CLAUDE.md: "don't build a second toggle
+     mechanism") — just not `initScene`. -->
+<nav class="console">
+  <a class="brand" href="/">EXONIT</a>
+  <a href="/">Dashboard</a>
+  <a href="/results">Results</a>
+  <a href="/completion">Completion</a>
+  <a href="/downloads">Downloads</a>
+  <a href="/status">Status</a>
+  <a href="/sky" aria-current="page">Sky</a>
+  <span class="console-live"><span data-fx-toggle>FX on</span></span>
+</nav>
+
+<main class="page">
+  <header class="page-head">
+    <div class="kicker">Sky</div>
+    <h1>Live sky map</h1>
+    <p>The stars under analysis, placed on the celestial sphere by right ascension and
+      declination. Drag to orbit, scroll to zoom, pick a point for its result.</p>
+  </header>
+
+  <!-- Block 4: toolbar — sector picker. -->
+  <div class="card elev-sm toolbar">
+    <div class="field"><label for="sectorSelect">Sector</label><select id="sectorSelect" class="input"></select></div>
+  </div>
+
+  <div class="cols">
+    <!-- Block 1: headline counts from the current snapshot. -->
+    <div class="row row-4 span-all" id="skyStats"></div>
+
+    <!-- Block 2: the map itself — three.js celestial sphere, orbit + zoom. -->
+    <div class="card elev-sm span-all">
+      <div class="sky-map-head">
+        <h3>Sky sphere — sector <span id="mapSectorLabel">—</span></h3>
+      </div>
+      <div class="sky-map-wrap" id="skyMapWrap">
+        <canvas id="skyCanvas" width="1000" height="600"
+          aria-label="3D celestial sphere: stars and candidates plotted by right ascension and declination. Drag to orbit, scroll to zoom, click a point for its details."></canvas>
+        <div class="pick-panel" id="pickPanel">
+          <button class="pick-close" id="pickClose" type="button" aria-label="Close"></button>
+          <div class="pick-tic" id="pickTic"></div>
+          <div class="pick-row"><span class="pick-label">Distance</span><span id="pickDist"></span></div>
+          <div class="pick-row"><span class="pick-label">Tmag</span><span id="pickTmag"></span></div>
+          <div class="pick-row"><span class="pick-label">Result</span><span id="pickResult"></span></div>
+          <div class="pick-row"><span class="pick-label">Sector</span><span id="pickSector"></span></div>
+          <div class="pick-note hidden" id="pickNote"></div>
+        </div>
+      </div>
+      <!-- Fallback for WebGL-init failure or FX off (spec §7: "fallback: if
+           no WebGL, message + candidate table"). Same data already
+           loaded for the 3D view, rendered as a plain table instead. -->
+      <div class="table-wrap hidden" id="skyFallback">
+        <table class="table" id="skyFallbackTable">
+          <thead><tr><th>TIC</th><th>Result</th><th>Tmag</th><th>Distance</th></tr></thead>
+          <tbody id="skyFallbackBody"></tbody>
+        </table>
+        <p class="empty hidden" id="skyFallbackEmpty">No candidates yet — run a scan to see them here.</p>
+      </div>
+      <p class="text-muted hidden" id="webglNote"></p>
+      <p class="text-muted hidden" id="bgNote"></p>
+      <p class="text-muted hidden" id="completedNote"></p>
+    </div>
+
+    <!-- Block 3: legend (per-layer visibility toggles) + live-refresh note. -->
+    <div class="card elev-sm">
+      <h3>Legend</h3>
+      <div class="legend">
+        <span class="legend-item" data-layer="background" tabindex="0" role="button" title="Toggle background stars">
+          <span class="swatch swatch-background"></span>Background stars</span>
+        <span class="legend-item" data-layer="active" tabindex="0" role="button" title="Toggle active stars">
+          <span class="swatch swatch-active"></span>Active now</span>
+        <span class="legend-item" data-layer="none" tabindex="0" role="button" title="Toggle completed, no candidate">
+          <span class="swatch swatch-none"></span>Completed — no candidate</span>
+        <span class="legend-item" data-layer="candidate" tabindex="0" role="button" title="Toggle candidates">
+          <span class="swatch swatch-candidate"></span>Candidate</span>
+        <span class="legend-item" data-layer="strong" tabindex="0" role="button" title="Toggle strong candidates">
+          <span class="swatch swatch-strong"></span>Strong</span>
+        <span class="legend-item legend-static" title="Sun / Earth — the fixed centre of the celestial sphere, not a data layer">
+          <span class="swatch swatch-sun"></span>Sun / Earth (centre)</span>
+      </div>
+      <p class="text-muted">Only active positions refresh automatically, every 5 seconds — the
+        background field and the completed-star snapshot load once. <span id="liveAge"></span></p>
+    </div>
+  </div>
+</main>
+
+<script type="module">
+import * as THREE from '/static/vendor/three.module.min.js';
+import { getJSON } from '/js/api.js';
+import { fmtInt, esc } from '/js/format.js';
+import { poll, staleNote } from '/js/poll.js';
+import { stat, icon, tag } from '/js/ui.js';
+import { fxEnabled, toggleFx } from '/js/scene.js';
+
+const RESULT_LABEL = { none: 'No candidate', candidate: 'Candidate', strong: 'Strong', active: 'Active now' };
+const AU_LY_PER_PC = 3.2616;  // 1 pc = 3.2616 light-years
+
+// /api/sky/completed?limit=N is the slowest of the four sky endpoints and
+// the one that scales with the request (see the routes/sky.py docstring):
+// 2000 completed stars is still a dense snapshot -- the live poll keeps
+// filling in the rest -- so this stays low rather than block first paint.
+const COMPLETED_LIMIT = 2000;
+
+// /api/sky/background can return up to 30,000 points (scripts/
+// precompute_sky_background.py --max-points default). The old canvas-2D map
+// drew all of them straight into a single 2D context (cheap there). A
+// three.js Points draw call is not free at that count on the budget this
+// app is held to (CLAUDE.md rule #2: these pages stay open on machines
+// doing GPU work) — subsample client-side, deterministic stride like the
+// server's own downsampling, same spirit as spec §0.3's point-count
+// discipline for scene.js's ambient field.
+const BG_POINT_BUDGET = 2200;
+
+const canvas = document.getElementById('skyCanvas');
+
+let bgPoints = [];       // [[ra, dec, tmag, dist_pc|undefined], ...]
+const completed = new Map();  // tic_id -> {tic_id, ra, dec, tmag, result, dist_pc}
+let active = [];         // [{tic_id, ra, dec, tmag, dist_pc}, ...] from the latest poll
+let currentSector = null;  // the sector the background is currently loaded for -- neither
+                            // /api/sky/live nor /api/sky/completed carry a per-star sector
+                            // field, so this is the only sector info the picking panel has.
+
+// ── Per-layer visibility (legend toggles), persisted ──
+const LAYER_STORAGE_KEY = 'exonit_sky_layers_v1';
+const DEFAULT_LAYERS = { background: true, none: true, candidate: true, strong: true, active: true };
+let layerVisible = { ...DEFAULT_LAYERS };
+(function loadLayerPrefs() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(LAYER_STORAGE_KEY) || '{}');
+    layerVisible = { ...DEFAULT_LAYERS, ...saved };
+  } catch (e) { /* corrupt/blocked storage -> defaults */ }
+})();
+function saveLayerPrefs() {
+  try { localStorage.setItem(LAYER_STORAGE_KEY, JSON.stringify(layerVisible)); } catch (e) {}
+}
+
+// ── Palette: read from the CSS tokens once at load (Deep Field has one
+// theme, no runtime swap — unlike the old canvas-2D map this replaces,
+// there's no MutationObserver here). Hex/rgba() fallbacks are for a broken
+// stylesheet only. ui_lint exemption: --allow-hex-in-script sky.html.
+// /* palette: handoff figures */
+function readTokens() {
+  const cs = getComputedStyle(document.documentElement);
+  const get = (name, fb) => (cs.getPropertyValue(name) || '').trim() || fb;
+  return {
+    inkMute: get('--ink-mute', '#6b7699'),
+    ink2: get('--ink-2', '#a8b3d6'),
+    accent: get('--accent', '#62d9ff'),
+    ok: get('--ok', '#35d07f'),
+    warn: get('--warn', '#ffc247'),
+    lineStrong: get('--line-strong', 'rgba(170, 195, 255, 0.28)'),
+    surfaceSolid: get('--surface-solid', '#10162e'),
+  };
+}
+const TOK = readTokens();
+// Verdict -> color, shared by the 3D layer materials, the pick panel's dot
+// and the fallback table's tags. Only 3 hues used across the whole scene
+// (mute/neutral, accent/cyan, ok/green) — spec §7's "NEVER more than 3
+// simultaneous color categories in the 3D view (all-pairs)".
+const RESULT_COLOR = { none: TOK.ink2, candidate: TOK.accent, strong: TOK.ok, active: TOK.accent };
+
+// rgba(r, g, b[, a]) or #rrggbb -> { hex, alpha }. --line-strong is an
+// rgba() token; THREE.Color only parses hex/named/rgb(), so this is needed
+// wherever a line/rgba token feeds a three.js material.
+function parseColorToken(raw, fallbackHex, fallbackAlpha = 1) {
+  const s = (raw || '').trim();
+  if (s.startsWith('#')) return { hex: s, alpha: 1 };
+  const m = s.match(/rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)(?:[,\s]+([\d.]+))?\s*\)/i);
+  if (m) {
+    const hex = `#${[m[1], m[2], m[3]].map((v) => Math.round(+v).toString(16).padStart(2, '0')).join('')}`;
+    return { hex, alpha: m[4] !== undefined ? +m[4] : 1 };
+  }
+  return { hex: fallbackHex, alpha: fallbackAlpha };
+}
+
+function formatDistance(pc) {
+  if (pc === null || pc === undefined) return '—';
+  return `${pc.toFixed(3)} pc · ${(pc * AU_LY_PER_PC).toFixed(3)} ly`;
+}
+
+// Deterministic stride subsample, same shape as the server's own
+// stride-sampling (scripts/precompute_sky_background.py) — not a random
+// draw, so reloading the same sector background gives the same field.
+function subsample(list, budget) {
+  if (list.length <= budget) return list;
+  const stride = Math.ceil(list.length / budget);
+  const out = [];
+  for (let i = 0; i < list.length; i += stride) out.push(list[i]);
+  return out;
+}
+
+// ra/dec (degrees) -> xyz on the sphere of the given radius. Plain
+// equatorial (RA/Dec) placement on the unit celestial sphere, per spec §7 —
+// this deliberately drops the old map's galactic-plane projection and its
+// Gaia-distance requirement (see the file-level decision note below the
+// imports... i.e. this comment block. Distance is display-only now, in the
+// pick panel; every star with ra/dec plots, none are omitted for lacking a
+// parallax).
+function raDecToXyz(raDeg, decDeg, radius) {
+  const ra = raDeg * Math.PI / 180;
+  const dec = decDeg * Math.PI / 180;
+  const cosDec = Math.cos(dec);
+  return [
+    radius * cosDec * Math.cos(ra),
+    radius * Math.sin(dec),
+    radius * cosDec * Math.sin(ra),
+  ];
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// DECISIONS (see the final report for the full write-up):
+//
+// - Camera OUTSIDE the sphere, orbiting it (not standing at the centre
+//   looking out). This is a "star globe you hold and rotate", not a
+//   planetarium view: the old 2D map's whole point was letting you see and
+//   pick from the *entire* loaded dataset at once and zoom into a region of
+//   interest, which only works from outside. An inside-looking-out camera
+//   would show one patch of sky at a time and make "zoom" meaningless
+//   (you're always ~0 units from every star on the shell).
+// - Picking: THREE.Points + Raycaster with a per-layer threshold, not
+//   individual meshes. The background layer alone can be ~2,000+ points
+//   after subsampling and completed/active add up to ~2,500 more — far past
+//   "low count, use tiny spheres" territory, and Points+Raycaster handles
+//   that cheaply (a plain per-vertex distance test, not a scene of ~5,000
+//   draw calls).
+// - No fabricated TESS sector-boundary bands: the API/data this page has
+//   access to (/api/sky/background, /api/sky/live, /api/sky/completed,
+//   /api/discovery/sectors) carries no per-sector footprint geometry, and
+//   inventing an approximate camera-boundary shape would be exactly the
+//   kind of drift CLAUDE.md's "no invent" rule forbids. Spec §7's hairline
+//   LineSegments requirement is instead met by the equatorial graticule,
+//   which the spec explicitly allows ("subtle optional equatorial grid")
+//   and which is real, derivable geometry (RA/Dec lines), not
+//   invented sector shapes.
+// ════════════════════════════════════════════════════════════════════════
+
+const SPHERE_R = 42;
+const ORBIT_MIN = 54, ORBIT_MAX = 230, ORBIT_DEFAULT = 108;
+const PITCH_LIMIT = 85 * Math.PI / 180;
+const DRAG_SENS = 0.006;
+const DAMPING = 0.90; // per-frame angular-velocity decay after release (§7.3 "soft inertia")
+const FRAME_INTERVAL_MS = 1000 / 30; // §0.3: ~30fps throttle
+const ACTIVE_PULSE_PERIOD_S = 1.6;
+
+// Per-layer point sizes (px; sizeAttenuation:false so picking stays legible
+// at any zoom, and so the on-screen visual hierarchy matches the old 2D
+// map's radii — background(1.6px radius) < none < candidate < strong ~=
+// active(pulsing largest) — regardless of camera distance).
+const SIZE = { background: 2.4, none: 3.2, candidate: 5.4, strong: 6.4, active: 7.2 };
+const ACTIVE_SIZE_AMP = 3.2;
+
+function bgDim(tmag) {
+  const t = (tmag === null || tmag === undefined) ? 12 : tmag;
+  return Math.max(0.32, Math.min(1, 1.22 - t * 0.045));
+}
+
+let _dotTexCache = null;
+function dotTexture() {
+  if (_dotTexCache) return _dotTexCache;
+  const size = 32;
+  const c = document.createElement('canvas');
+  c.width = c.height = size;
+  const g = c.getContext('2d');
+  const grad = g.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+  grad.addColorStop(0, 'rgba(255,255,255,1)');
+  grad.addColorStop(0.45, 'rgba(255,255,255,0.85)');
+  grad.addColorStop(1, 'rgba(255,255,255,0)');
+  g.fillStyle = grad;
+  g.fillRect(0, 0, size, size);
+  _dotTexCache = new THREE.CanvasTexture(c);
+  return _dotTexCache;
+}
+
+let _ringTexCache = null;
+function ringTexture() {
+  if (_ringTexCache) return _ringTexCache;
+  const size = 64;
+  const c = document.createElement('canvas');
+  c.width = c.height = size;
+  const g = c.getContext('2d');
+  g.strokeStyle = 'white';
+  g.lineWidth = 4;
+  g.beginPath();
+  g.arc(size / 2, size / 2, size / 2 - 4, 0, Math.PI * 2);
+  g.stroke();
+  _ringTexCache = new THREE.CanvasTexture(c);
+  return _ringTexCache;
+}
+
+function buildGraticule(radius, colorToken) {
+  const positions = [];
+  const N = 48;
+  const decSteps = [-60, -30, 0, 30, 60];
+  const raSteps = [0, 30, 60, 90, 120, 150, 180, 210, 240, 270, 300, 330];
+  for (const decDeg of decSteps) {
+    const dec = decDeg * Math.PI / 180;
+    let prev = null;
+    for (let i = 0; i <= N; i++) {
+      const ra = (i / N) * 2 * Math.PI;
+      const p = [radius * Math.cos(dec) * Math.cos(ra), radius * Math.sin(dec), radius * Math.cos(dec) * Math.sin(ra)];
+      if (prev) positions.push(...prev, ...p);
+      prev = p;
+    }
+  }
+  for (const raDeg of raSteps) {
+    const ra = raDeg * Math.PI / 180;
+    let prev = null;
+    for (let i = 0; i <= N; i++) {
+      const dec = -Math.PI / 2 + (i / N) * Math.PI;
+      const p = [radius * Math.cos(dec) * Math.cos(ra), radius * Math.sin(dec), radius * Math.cos(dec) * Math.sin(ra)];
+      if (prev) positions.push(...prev, ...p);
+      prev = p;
+    }
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  const mat = new THREE.LineBasicMaterial({
+    color: new THREE.Color(colorToken.hex), transparent: true, opacity: colorToken.alpha * 0.6,
+  });
+  const lines = new THREE.LineSegments(geo, mat);
+  lines.frustumCulled = false;
+  return lines;
+}
+
+// ── three.js scene state (populated by initThree(); stays null in fallback) ──
+let renderer = null, scene = null, camera = null;
+let backgroundPoints, nonePoints, candidatePoints, strongPoints, activePoints;
+let activeMaterial;
+let hoverMarker, selectionMarker;
+let usingFallback = false;
+let reducedMotion = false;
+let running = false, rafId = null, lastFrameTime = 0, lastElapsedS = 0;
+let azimuth = 0.5, elevation = 0.32, orbitRadius = ORBIT_DEFAULT;
+let dragging = false, lastPX = 0, lastPY = 0, velAz = 0, velEl = 0;
+const raycaster = new THREE.Raycaster();
+const ndc = new THREE.Vector2();
+let selected = null; // the info object behind the currently-open pick panel, or null
+
+function makeLayerMaterial(colorHex, sizePx, { vertexColors = false } = {}) {
+  return new THREE.PointsMaterial({
+    color: new THREE.Color(colorHex),
+    size: sizePx,
+    sizeAttenuation: false,
+    map: dotTexture(),
+    vertexColors,
+    transparent: true,
+    depthWrite: false,
+    alphaTest: 0.02,
+  });
+}
+
+function makePointsLayer(key, material) {
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(0), 3));
+  const pts = new THREE.Points(geo, material);
+  pts.userData = { key, records: [] };
+  pts.frustumCulled = false; // tiny scene; avoids any pop-in while orbiting close to the shell
+  return pts;
+}
+
+function buildPositions(records, radius) {
+  const pos = new Float32Array(records.length * 3);
+  for (let i = 0; i < records.length; i++) {
+    const [x, y, z] = raDecToXyz(records[i].ra, records[i].dec, radius);
+    pos[i * 3] = x; pos[i * 3 + 1] = y; pos[i * 3 + 2] = z;
+  }
+  return pos;
+}
+
+function setLayerData(pts, records) {
+  pts.geometry.dispose();
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(buildPositions(records, SPHERE_R), 3));
+  pts.geometry = geo;
+  pts.userData.records = records;
+}
+
+function setBackgroundData(records) {
+  backgroundPoints.geometry.dispose();
+  const pos = new Float32Array(records.length * 3);
+  const col = new Float32Array(records.length * 3);
+  const base = new THREE.Color(TOK.inkMute);
+  for (let i = 0; i < records.length; i++) {
+    const [x, y, z] = raDecToXyz(records[i].ra, records[i].dec, SPHERE_R);
+    pos[i * 3] = x; pos[i * 3 + 1] = y; pos[i * 3 + 2] = z;
+    const dim = bgDim(records[i].tmag);
+    col[i * 3] = base.r * dim; col[i * 3 + 1] = base.g * dim; col[i * 3 + 2] = base.b * dim;
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  backgroundPoints.geometry = geo;
+  backgroundPoints.userData.records = records;
+}
+
+function updateCameraPosition() {
+  const ce = Math.cos(elevation), se = Math.sin(elevation);
+  const ca = Math.cos(azimuth), sa = Math.sin(azimuth);
+  camera.position.set(orbitRadius * ce * sa, orbitRadius * se, orbitRadius * ce * ca);
+  camera.lookAt(0, 0, 0);
+}
+
+function renderOnce() {
+  if (renderer) renderer.render(scene, camera);
+}
+// Called after any camera/data/selection change so reduced-motion mode
+// (which never runs the rAF loop) still reflects the new state — spec §0.3
+// point 6: "manual orbit keeps working: re-render on input").
+function requestRender() {
+  if (usingFallback || !renderer) return;
+  if (reducedMotion) renderOnce();
+}
+
+function applyInertia() {
+  if (dragging) return;
+  if (Math.abs(velAz) < 1e-5 && Math.abs(velEl) < 1e-5) return;
+  azimuth += velAz;
+  elevation = Math.max(-PITCH_LIMIT, Math.min(PITCH_LIMIT, elevation + velEl));
+  velAz *= DAMPING; velEl *= DAMPING;
+  updateCameraPosition();
+}
+
+function renderFrame(elapsedS) {
+  lastElapsedS = elapsedS;
+  applyInertia();
+  if (layerVisible.active) {
+    const pulse = 0.55 + 0.45 * Math.sin(elapsedS * (2 * Math.PI / ACTIVE_PULSE_PERIOD_S));
+    activeMaterial.size = SIZE.active + ACTIVE_SIZE_AMP * pulse;
+    activeMaterial.opacity = 0.6 + 0.4 * pulse;
+  }
+  renderer.render(scene, camera);
+}
+
+function animate(now) {
+  if (!running) return;
+  rafId = requestAnimationFrame(animate);
+  if (now - lastFrameTime < FRAME_INTERVAL_MS) return; // §0.3: ~30fps throttle
+  lastFrameTime = now;
+  renderFrame(now / 1000);
+}
+function start() {
+  if (running || reducedMotion) return;
+  running = true; lastFrameTime = 0;
+  rafId = requestAnimationFrame(animate);
+}
+function stop() {
+  running = false;
+  if (rafId !== null) cancelAnimationFrame(rafId);
+  rafId = null;
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) stop(); else if (!reducedMotion) start();
+});
+
+// ── Picking (raycaster over the visible Points layers) ──────────────────
+function recordToInfo(rec, key, point) {
+  return {
+    tic_id: rec.tic_id || null,
+    tmag: rec.tmag,
+    dist_pc: rec.dist_pc,
+    result: key === 'background' ? null : (rec.result || key),
+    sector: key === 'background' ? currentSector : null,
+    isBackground: key === 'background',
+    point,
+  };
+}
+
+function firstHit(layerObjs, threshold) {
+  const objs = layerObjs.filter((o) => o && o.userData.records.length);
+  if (!objs.length) return null;
+  raycaster.params.Points = { threshold };
+  const hits = raycaster.intersectObjects(objs, false);
+  if (!hits.length) return null;
+  const h = hits[0];
+  return recordToInfo(h.object.userData.records[h.index], h.object.userData.key, h.point);
+}
+
+// Priority mirrors visual significance (active/strong first), then falls
+// back to the dense background field with a tighter threshold — same
+// "foreground before background" shape as the old 2D pickAt().
+function pickAt(clientX, clientY) {
+  const rect = canvas.getBoundingClientRect();
+  ndc.x = ((clientX - rect.left) / rect.width) * 2 - 1;
+  ndc.y = -((clientY - rect.top) / rect.height) * 2 + 1;
+  raycaster.setFromCamera(ndc, camera);
+
+  const fg = [];
+  if (layerVisible.active) fg.push(activePoints);
+  if (layerVisible.strong) fg.push(strongPoints);
+  if (layerVisible.candidate) fg.push(candidatePoints);
+  if (layerVisible.none) fg.push(nonePoints);
+  const hit = firstHit(fg, 1.4);
+  if (hit) return hit;
+  if (!layerVisible.background) return null;
+  return firstHit([backgroundPoints], 0.9);
+}
+
+let lastHoverT = 0;
+function handleHover(clientX, clientY) {
+  const now = performance.now();
+  if (now - lastHoverT < 50) return; // throttle: rule #2 leaves CPU/GPU headroom
+  lastHoverT = now;
+  const hit = pickAt(clientX, clientY);
+  canvas.style.cursor = hit ? 'pointer' : '';
+  if (hit) { hoverMarker.position.copy(hit.point); hoverMarker.visible = true; }
+  else hoverMarker.visible = false;
+  requestRender();
+}
+
+// ── Pick panel (same fields/behaviour as the old 2D map) ────────────────
+function showPickPanel(info) {
+  selected = info;
+  document.getElementById('pickTic').textContent = info.tic_id ? `TIC ${info.tic_id}` : 'Background star';
+  document.getElementById('pickDist').textContent = formatDistance(info.dist_pc);
+  document.getElementById('pickTmag').textContent =
+    (info.tmag === null || info.tmag === undefined) ? '—' : Number(info.tmag).toFixed(2);
+  const resultEl = document.getElementById('pickResult');
+  if (info.result) {
+    const dot = document.createElement('span');
+    dot.className = 'pick-dot';
+    dot.style.background = RESULT_COLOR[info.result] || TOK.ink2;
+    resultEl.textContent = '';
+    resultEl.appendChild(dot);
+    resultEl.append(RESULT_LABEL[info.result] || info.result);
+  } else {
+    resultEl.textContent = '—';
+  }
+  document.getElementById('pickSector').textContent =
+    (info.sector === null || info.sector === undefined) ? '—' : info.sector;
+  const note = document.getElementById('pickNote');
+  if (info.isBackground) {
+    note.textContent = 'Background star — position/brightness sampling only, no TIC in this dataset.';
+    note.classList.remove('hidden');
+  } else {
+    note.classList.add('hidden');
+  }
+  document.getElementById('pickPanel').classList.add('visible');
+  if (selectionMarker && info.point) {
+    selectionMarker.position.copy(info.point);
+    selectionMarker.visible = true;
+  }
+  requestRender();
+}
+
+function hidePickPanel() {
+  selected = null;
+  document.getElementById('pickPanel').classList.remove('visible');
+  if (selectionMarker) selectionMarker.visible = false;
+  requestRender();
+}
+
+// ── Orbit / zoom interaction (spec §7 point 3: drag = orbit with inertia,
+// wheel = zoom, ±85° pitch clamp, no OrbitControls import) ──────────────
+function wireInteraction() {
+  canvas.style.touchAction = 'none'; // let a single touch drive orbit instead of page scroll
+
+  canvas.addEventListener('pointerdown', (e) => {
+    dragging = true; lastPX = e.clientX; lastPY = e.clientY; velAz = 0; velEl = 0;
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+  });
+  canvas.addEventListener('pointerup', (e) => {
+    dragging = false;
+    try { canvas.releasePointerCapture(e.pointerId); } catch (err) {}
+  });
+  canvas.addEventListener('pointercancel', () => { dragging = false; });
+  canvas.addEventListener('pointermove', (e) => {
+    if (dragging) {
+      const dx = e.clientX - lastPX, dy = e.clientY - lastPY;
+      lastPX = e.clientX; lastPY = e.clientY;
+      const dAz = -dx * DRAG_SENS, dEl = dy * DRAG_SENS;
+      azimuth += dAz;
+      elevation = Math.max(-PITCH_LIMIT, Math.min(PITCH_LIMIT, elevation + dEl));
+      velAz = dAz; velEl = dEl;
+      updateCameraPosition();
+      requestRender();
+    } else {
+      handleHover(e.clientX, e.clientY);
+    }
+  });
+  canvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    orbitRadius = Math.max(ORBIT_MIN, Math.min(ORBIT_MAX, orbitRadius * (1 + Math.sign(e.deltaY) * 0.08)));
+    updateCameraPosition();
+    requestRender();
+  }, { passive: false });
+  canvas.addEventListener('click', (e) => {
+    // A drag-release also fires a click; picking whatever's under the
+    // cursor at release is fine (matches the old map's plain click-to-pick).
+    const hit = pickAt(e.clientX, e.clientY);
+    if (hit) showPickPanel(hit); else hidePickPanel();
+  });
+}
+
+// ── three.js init (WebGL try/catch -> silent table fallback, spec §0.3/§7) ──
+function initThree() {
+  try {
+    reducedMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    renderer = new THREE.WebGLRenderer({
+      canvas, alpha: false,
+      antialias: (Math.min(window.devicePixelRatio || 1, 1.5)) <= 1,
+      powerPreference: 'low-power',
+    });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5)); // §0.3
+    renderer.setClearColor(new THREE.Color(TOK.surfaceSolid), 1);
+
+    scene = new THREE.Scene();
+    camera = new THREE.PerspectiveCamera(50, 1000 / 600, 0.1, 800);
+
+    backgroundPoints = makePointsLayer('background', makeLayerMaterial('#ffffff', SIZE.background, { vertexColors: true }));
+    nonePoints = makePointsLayer('none', makeLayerMaterial(TOK.ink2, SIZE.none));
+    candidatePoints = makePointsLayer('candidate', makeLayerMaterial(TOK.accent, SIZE.candidate));
+    strongPoints = makePointsLayer('strong', makeLayerMaterial(TOK.ok, SIZE.strong));
+    activeMaterial = makeLayerMaterial(TOK.accent, SIZE.active);
+    activePoints = makePointsLayer('active', activeMaterial);
+    scene.add(backgroundPoints, nonePoints, candidatePoints, strongPoints, activePoints);
+
+    const gratColor = parseColorToken(TOK.lineStrong, '#aac3ff', 0.28);
+    scene.add(buildGraticule(SPHERE_R, gratColor));
+
+    // Sun/Earth: the observer sits at the literal centre of a celestial
+    // sphere — this is the legend's "Sun / Earth (centre)" entry made real,
+    // not decoration invented on top of it.
+    const sunMat = new THREE.SpriteMaterial({
+      map: dotTexture(), color: new THREE.Color(TOK.warn), transparent: true, depthTest: false, depthWrite: false,
+    });
+    const sunSprite = new THREE.Sprite(sunMat);
+    sunSprite.scale.set(2.6, 2.6, 1);
+    scene.add(sunSprite);
+
+    const ring = ringTexture();
+    hoverMarker = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: ring, color: new THREE.Color(TOK.accent), opacity: 0.55, transparent: true, depthTest: false, depthWrite: false,
+    }));
+    hoverMarker.scale.set(3.4, 3.4, 1);
+    hoverMarker.visible = false;
+    selectionMarker = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: ring, color: new THREE.Color(TOK.accent), opacity: 0.95, transparent: true, depthTest: false, depthWrite: false,
+    }));
+    selectionMarker.scale.set(5, 5, 1);
+    selectionMarker.visible = false;
+    scene.add(hoverMarker, selectionMarker);
+
+    updateCameraPosition();
+    wireInteraction();
+
+    function resize() {
+      const w = canvas.clientWidth || 800;
+      const h = canvas.clientHeight || Math.round(w * 0.6);
+      if (!w || !h) return;
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+      renderer.setSize(w, h, false);
+      requestRender();
+    }
+    if (typeof ResizeObserver !== 'undefined') new ResizeObserver(resize).observe(canvas);
+    else window.addEventListener('resize', resize);
+    resize();
+
+    if (reducedMotion) renderOnce();
+    else if (!document.hidden) start();
+    return true;
+  } catch (err) {
+    console.error('[sky] WebGL init failed:', err);
+    return false;
+  }
+}
+
+// ── No-WebGL / FX-off fallback: message + candidate table ───────────────
+function rowKind(result) {
+  return { strong: 'accent-2', candidate: 'accent', active: 'accent', none: 'neutral' }[result] || 'neutral';
+}
+function fallbackRowHtml(s) {
+  return `<tr>
+    <td class="num">${s.tic_id ? `TIC ${esc(String(s.tic_id))}` : '—'}</td>
+    <td>${tag(RESULT_LABEL[s.result] || s.result, rowKind(s.result))}</td>
+    <td class="num">${s.tmag === null || s.tmag === undefined ? '—' : Number(s.tmag).toFixed(2)}</td>
+    <td class="num">${formatDistance(s.dist_pc)}</td>
+  </tr>`;
+}
+function updateFallbackTable() {
+  if (!usingFallback) return;
+  const CAP = 300;
+  const order = { active: 0, strong: 1, candidate: 2, none: 3 };
+  const rows = [
+    ...active.map((s) => ({ ...s, result: 'active' })),
+    ...completed.values(),
+  ].sort((a, b) => (order[a.result] ?? 9) - (order[b.result] ?? 9));
+
+  const tbody = document.getElementById('skyFallbackBody');
+  const emptyEl = document.getElementById('skyFallbackEmpty');
+  const tableEl = document.getElementById('skyFallbackTable');
+  if (!rows.length) {
+    tbody.innerHTML = '';
+    tableEl.classList.add('hidden');
+    emptyEl.classList.remove('hidden');
+    return;
+  }
+  emptyEl.classList.add('hidden');
+  tableEl.classList.remove('hidden');
+  const shown = rows.slice(0, CAP);
+  tbody.innerHTML = shown.map(fallbackRowHtml).join('')
+    + (rows.length > CAP ? `<tr class="row-muted"><td colspan="4">…and ${fmtInt(rows.length - CAP)} more</td></tr>` : '');
+}
+
+function enableFallback(reason) {
+  usingFallback = true;
+  document.getElementById('skyMapWrap').classList.add('hidden');
+  document.getElementById('skyFallback').classList.remove('hidden');
+  const note = document.getElementById('webglNote');
+  note.textContent = reason;
+  note.classList.remove('hidden');
+  updateFallbackTable();
+}
+
+// ── Data-driven layer rebuilds (called on data load, never per animation
+// frame — spec §0.3 point 6: "no geometry filters on re-render") ──────
+function rebuildResultLayers() {
+  const noneRecs = [], candRecs = [], strongRecs = [];
+  for (const s of completed.values()) {
+    if (s.ra === null || s.ra === undefined || s.dec === null || s.dec === undefined) continue;
+    if (s.result === 'strong') strongRecs.push(s);
+    else if (s.result === 'candidate') candRecs.push(s);
+    else noneRecs.push(s);
+  }
+  if (renderer && !usingFallback) {
+    setLayerData(nonePoints, noneRecs);
+    setLayerData(candidatePoints, candRecs);
+    setLayerData(strongPoints, strongRecs);
+  }
+  updateFallbackTable();
+  requestRender();
+}
+
+function rebuildActiveLayer() {
+  const recs = active
+    .filter((s) => s.ra !== null && s.ra !== undefined && s.dec !== null && s.dec !== undefined)
+    .map((s) => ({ ...s, result: 'active' }));
+  if (renderer && !usingFallback) setLayerData(activePoints, recs);
+  updateFallbackTable();
+  requestRender();
+}
+
+function rebuildBackgroundLayer() {
+  const recs = subsample(
+    bgPoints
+      .map(([ra, dec, tmag, dist]) => ({ tic_id: null, ra, dec, tmag, dist_pc: dist, result: null }))
+      .filter((r) => r.ra !== null && r.ra !== undefined && r.dec !== null && r.dec !== undefined),
+    BG_POINT_BUDGET,
+  );
+  if (renderer && !usingFallback) setBackgroundData(recs);
+  requestRender();
+}
+
+// ── Counters (block 1 — headline stat row) ─────────────────────────
+function renderStats() {
+  let nCandidate = 0, nStrong = 0;
+  for (const star of completed.values()) {
+    if (star.result === 'strong') nStrong++;
+    else if (star.result === 'candidate') nCandidate++;
+  }
+  document.getElementById('skyStats').innerHTML = [
+    stat('Active now', fmtInt(active.length)),
+    stat('Completed seen', fmtInt(completed.size)),
+    stat('Candidates', fmtInt(nCandidate + nStrong)),
+    stat('Strong', fmtInt(nStrong)),
+  ].join('');
+}
+
+function mergeStars(list) {
+  for (const s of list) {
+    completed.set(s.tic_id, {
+      tic_id: s.tic_id, ra: s.ra, dec: s.dec, tmag: s.tmag, result: s.result,
+      dist_pc: s.dist_pc,
+    });
+  }
+}
+
+// ── Interactive legend (per-layer visibility toggle) ─────
+function updateLegendVisualState() {
+  document.querySelectorAll('.legend-item[data-layer]').forEach((el) => {
+    el.classList.toggle('layer-hidden', !layerVisible[el.dataset.layer]);
+  });
+}
+
+const LAYER_POINTS = () => ({
+  background: backgroundPoints, none: nonePoints, candidate: candidatePoints,
+  strong: strongPoints, active: activePoints,
+});
+
+function toggleLayer(key) {
+  layerVisible[key] = !layerVisible[key];
+  saveLayerPrefs();
+  updateLegendVisualState();
+  if (renderer && !usingFallback) {
+    const pts = LAYER_POINTS()[key];
+    if (pts) pts.visible = layerVisible[key];
+  }
+  requestRender();
+}
+
+function wireLegend() {
+  document.querySelectorAll('.legend-item[data-layer]').forEach((el) => {
+    el.addEventListener('click', () => toggleLayer(el.dataset.layer));
+    el.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        toggleLayer(el.dataset.layer);
+      }
+    });
+  });
+  updateLegendVisualState();
+}
+
+// ── Data loading ────────────────────────────────────────────────
+async function loadBackground(sector) {
+  const note = document.getElementById('bgNote');
+  currentSector = sector;
+  note.textContent = `Loading background — sector ${sector}…`;
+  note.classList.remove('hidden');
+  try {
+    const data = await getJSON(`/api/sky/background?sector=${sector}`);
+    note.classList.add('hidden');
+    bgPoints = data.points || [];
+    rebuildBackgroundLayer();
+    renderStats();
+  } catch (err) {
+    bgPoints = [];
+    rebuildBackgroundLayer();
+    const msg = /^\d{3}\s/.test(err.message)
+      ? `No background for sector ${sector} — run scripts/precompute_sky_background.py --sector ${sector}`
+      : err.message;
+    note.textContent = msg;
+    note.classList.remove('hidden');
+  }
+}
+
+async function loadCompletedSnapshot() {
+  const note = document.getElementById('completedNote');
+  note.textContent = 'Loading completed stars…';
+  note.classList.remove('hidden');
+  try {
+    const data = await getJSON(`/api/sky/completed?limit=${COMPLETED_LIMIT}`);
+    mergeStars(data.stars || []);
+    rebuildResultLayers();
+    renderStats();
+    note.classList.add('hidden');
+  } catch (e) {
+    // one-time snapshot -- the live poll will still populate the map.
+    note.textContent = 'Could not load the completed-star snapshot — the live feed will still fill in the map.';
+    note.classList.remove('hidden');
+  }
+}
+
+async function loadLive() {
+  const data = await getJSON('/api/sky/live');
+  active = (data.active || []).filter((s) => s.ra !== null && s.dec !== null);
+  mergeStars(data.recent || []);
+  rebuildActiveLayer();
+  rebuildResultLayers();
+  renderStats();
+}
+
+// ── Sector picker ───────────────────────────────────────────────
+async function initSectorPicker() {
+  const select = document.getElementById('sectorSelect');
+  let sectors = [];
+  let activeSector = null;
+  try {
+    const d = await getJSON('/api/discovery/sectors');
+    sectors = d.sectors || [];
+    activeSector = d.active_sector;
+  } catch (e) { /* fall back to a single default option below */ }
+
+  if (!sectors.length) sectors = [{ number: activeSector || 1 }];
+  select.innerHTML = sectors.map((s) => `<option value="${s.number}">Sector ${s.number}</option>`).join('');
+  select.value = activeSector || sectors[0].number;
+  select.addEventListener('change', () => {
+    document.getElementById('mapSectorLabel').textContent = select.value;
+    loadBackground(select.value);
+  });
+  document.getElementById('mapSectorLabel').textContent = select.value;
+  return select.value;
+}
+
+// ── Init ────────────────────────────────────────────────────────
+(async function init() {
+  renderStats();
+  document.getElementById('pickClose').innerHTML = icon('x');
+
+  const fxToggleEl = document.querySelector('[data-fx-toggle]');
+  fxToggleEl.textContent = `FX ${fxEnabled() ? 'on' : 'off'}`;
+  fxToggleEl.addEventListener('click', toggleFx);
+
+  wireLegend();
+  document.getElementById('pickClose').addEventListener('click', hidePickPanel);
+
+  if (fxEnabled()) {
+    const ok = initThree();
+    if (!ok) enableFallback('The 3D sky view could not start (WebGL unavailable) — showing candidates as a table instead.');
+  } else {
+    canvas.hidden = true;
+    enableFallback('3D view is off (FX off) — showing candidates as a table instead.');
+  }
+
+  // Every layer below loads independently and in parallel, each with its
+  // own "Loading…" note that clears on arrival (see loadBackground /
+  // loadCompletedSnapshot) -- a slow layer must never hold up a fast one.
+  // Only /api/sky/background needs the active sector first, so it chains
+  // off initSectorPicker(); completed and live fire immediately and don't
+  // wait for it. Only /api/sky/live refreshes automatically (5 s);
+  // background and the completed snapshot are loaded once, and background
+  // is re-requested only when the sector <select> changes (see
+  // initSectorPicker's change listener) -- never on the live poll tick.
+  initSectorPicker().then((sector) => loadBackground(sector));
+  loadCompletedSnapshot();
+  const liveHandle = poll(loadLive, 5000);
+  staleNote(document.getElementById('liveAge'), liveHandle);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,119 @@
+{
+  "generated_at": "2026-07-25T00:27:24+00:00",
+  "sources": [
+    {
+      "log": "/tmp/discovery_orch_8xcooiza.log",
+      "started": "2026-07-24T17:36:37",
+      "lot": 100000,
+      "partial": false
+    },
+    {
+      "log": "~/exonit/data/discovery/orchestrator_adopt_20260719.log",
+      "started": "2026-07-19T08:43:19",
+      "lot": 300000,
+      "partial": true
+    },
+    {
+      "log": "~/exonit/data/discovery/orch_resume_s0002.log",
+      "started": "2026-07-06T18:55:34",
+      "lot": null,
+      "partial": true
+    }
+  ],
+  "note": "Median phase durations mined from discovery orchestrator logs (scripts/phase_timing_stats.py). 'per_1k_tics_s' is the lot-normalised cost; phases with scales_with_lot=false cost the same regardless of lot size. Used by the dashboard to estimate phases that have not started yet.",
+  "runs_mined": 3,
+  "runs_with_lot_size": 2,
+  "lot_sizes": [
+    100000,
+    300000
+  ],
+  "phases": {
+    "SCANNING": {
+      "median_s": 8830.0,
+      "latest_s": 14753.0,
+      "min_s": 6517.0,
+      "max_s": 14753.0,
+      "samples": 3,
+      "scales_with_lot": true,
+      "per_1k_tics_s": 147.53,
+      "latest_per_1k_tics_s": 147.53,
+      "per_1k_samples": 1
+    },
+    "FPP_BACKFILL": {
+      "median_s": 1299.0,
+      "latest_s": 1299.0,
+      "min_s": 374.0,
+      "max_s": 3283.0,
+      "samples": 3,
+      "scales_with_lot": true,
+      "per_1k_tics_s": 12.99,
+      "latest_per_1k_tics_s": 12.99,
+      "per_1k_samples": 1
+    },
+    "EXOMINER_BACKFILL": {
+      "median_s": 5.0,
+      "latest_s": 5.0,
+      "min_s": 1.0,
+      "max_s": 6.0,
+      "samples": 3,
+      "scales_with_lot": true,
+      "per_1k_tics_s": 0.05,
+      "latest_per_1k_tics_s": 0.05,
+      "per_1k_samples": 1
+    },
+    "STOP_WORKERS": {
+      "median_s": 81.0,
+      "latest_s": 81.0,
+      "min_s": 68.0,
+      "max_s": 89.0,
+      "samples": 3,
+      "scales_with_lot": false
+    },
+    "POSTPROCESS": {
+      "median_s": 127.0,
+      "latest_s": 127.0,
+      "min_s": 98.0,
+      "max_s": 213.0,
+      "samples": 3,
+      "scales_with_lot": true,
+      "per_1k_tics_s": 1.27,
+      "latest_per_1k_tics_s": 1.27,
+      "per_1k_samples": 1
+    },
+    "STOP_NVIDIARACK": {
+      "median_s": 3.0,
+      "latest_s": 3.0,
+      "min_s": 3.0,
+      "max_s": 5.0,
+      "samples": 3,
+      "scales_with_lot": false
+    },
+    "LORA": {
+      "median_s": 1492.0,
+      "latest_s": 1492.0,
+      "min_s": 846.0,
+      "max_s": 1673.0,
+      "samples": 3,
+      "scales_with_lot": true,
+      "per_1k_tics_s": 14.92,
+      "latest_per_1k_tics_s": 14.92,
+      "per_1k_samples": 1
+    },
+    "FREE_GPU": {
+      "median_s": 0.0,
+      "latest_s": 0.0,
+      "min_s": 0.0,
+      "max_s": 0.0,
+      "samples": 3,
+      "scales_with_lot": false
+    },
+    "FINALIZE": {
+      "median_s": 977.0,
+      "latest_s": 2570.0,
+      "min_s": 7.0,
+      "max_s": 2570.0,
+      "samples": 3,
+      "scales_with_lot": false
+    }
+  }
+}

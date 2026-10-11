@@ -1,0 +1,821 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ExoNit — Results</title>
+  <link rel="stylesheet" href="/static/exonit.css">
+</head>
+<body>
+  <canvas id="bgScene" aria-hidden="true"></canvas>
+  <nav class="console">
+    <a class="brand" href="/">EXONIT</a>
+    <a href="/">Dashboard</a>
+    <a href="/results" aria-current="page">Results</a>
+    <a href="/completion">Completion</a>
+    <a href="/downloads">Downloads</a>
+    <a href="/status">Status</a>
+    <a href="/sky">Sky</a>
+    <span class="console-live"><span data-fx-toggle>FX on</span></span>
+  </nav>
+
+  <main class="page">
+    <header class="page-head">
+      <div class="kicker">Results</div>
+      <h1>Candidates &amp; scorecards</h1>
+      <p>Every transit candidate the pipeline has found, the scorecards that measure a run's
+        quality, and the exports for ExoFOP submission.</p>
+    </header>
+
+    <div class="stack">
+      <section id="headline"></section>
+
+      <section class="card elev-sm toolbar" id="toolbar">
+        <div class="field">
+          <label for="ctoiMinSnr">cTOI min SNR</label>
+          <select class="input" id="ctoiMinSnr">
+            <option value="10">10</option>
+            <option value="15" selected>15</option>
+            <option value="25">25</option>
+            <option value="50">50</option>
+          </select>
+        </div>
+        <a class="btn btn-primary" id="csvExportLink" href="/api/export/csv">Export candidates CSV</a>
+        <a class="btn btn-secondary" href="/api/export/json">Export candidates JSON</a>
+        <a class="btn btn-secondary" id="ctoiExportLink" href="/api/ctoi/export?min_snr=15">Export cTOI CSV</a>
+      </section>
+
+      <section class="card elev-sm" id="candidatesBlock">
+        <h3>Candidates</h3>
+        <div class="controls">
+          <div class="field">
+            <label for="candSearch">TIC ID</label>
+            <input class="input" id="candSearch" type="text" placeholder="Search a TIC id&hellip;">
+          </div>
+          <div class="field">
+            <label for="candFilter">Filter</label>
+            <select class="input" id="candFilter">
+              <option value="all">All</option>
+              <option value="strong">Strong (SNR &ge; 10, CNN &ge; 0.7)</option>
+              <option value="validated">Validated (FPP &lt; 0.015)</option>
+              <option value="planet">Planet candidate (Claude)</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="candSort">Sort by</label>
+            <select class="input" id="candSort">
+              <option value="snr">SNR</option>
+              <option value="period">Period</option>
+              <option value="depth">Depth</option>
+              <option value="cnn">CNN</option>
+            </select>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="table table-clickable">
+            <thead>
+              <tr>
+                <th>TIC ID</th><th>Period (d)</th><th>Depth (ppm)</th><th>SNR</th>
+                <th>CNN</th><th>FPP</th><th>Verdict</th>
+              </tr>
+            </thead>
+            <tbody id="candidatesBody"><tr><td colspan="7" class="text-muted">Loading&hellip;</td></tr></tbody>
+          </table>
+        </div>
+        <div class="controls">
+          <button class="btn btn-secondary" id="candPrev" type="button">Prev</button>
+          <span class="text-muted num" id="candPageInfo">&mdash;</span>
+          <button class="btn btn-secondary" id="candNext" type="button">Next</button>
+        </div>
+      </section>
+
+      <!-- Full-width scorecards + completeness block (operator decision 2026-07-25,
+           same pattern as status.html's Workers/Machines blocks). The select
+           lives in a scoped .controls row like the Candidates block's filter
+           row, but widened (see exonit.css — #scorecardsBlock .controls
+           .field) because its option text is a full run id + date + hint,
+           much longer than a typical 170px filter field can show without
+           truncating. #scorecardContent already uses auto-fill grids
+           (.stat-grid, .kv-grid) that reflow into more columns on their own
+           once given the width, so no restructuring needed there. -->
+      <section class="card elev-sm" id="scorecardsBlock">
+        <h3>Scorecards</h3>
+        <div class="controls">
+          <div class="field">
+            <label for="scorecardSelect">Scorecard</label>
+            <select class="input" id="scorecardSelect"><option value="">Loading&hellip;</option></select>
+          </div>
+        </div>
+        <div id="scorecardContent"><p class="text-muted">Select a scorecard above.</p></div>
+
+        <div class="card-head">
+          <h4>Detection completeness</h4>
+          <button class="btn btn-secondary" id="heatTableToggle" type="button" hidden>Table view</button>
+        </div>
+        <div id="heatmapBox"><p class="text-muted">Loading&hellip;</p></div>
+        <div id="heatmapLegend"></div>
+        <div id="heatmapTable" hidden></div>
+      </section>
+    </div>
+
+    <p class="text-muted" id="staleNote"></p>
+  </main>
+
+  <div class="dialog-backdrop" id="dialogBackdrop" hidden>
+    <div class="dialog dialog-wide">
+      <div class="dialog-head">
+        <div class="dialog-title" id="dialogTitle">Candidate detail</div>
+        <button class="btn btn-icon btn-secondary" id="dialogClose" type="button" aria-label="Close"></button>
+      </div>
+      <div class="dialog-body" id="dialogBody"></div>
+    </div>
+  </div>
+
+  <script type="module">
+    import { getJSON } from '/js/api.js';
+    import { esc, fmtInt, fmtNum, fmtPct } from '/js/format.js';
+    import { poll, staleNote } from '/js/poll.js';
+    import { stat, meter, tag, icon } from '/js/ui.js';
+    import { initScene, fxEnabled, toggleFx } from '/js/scene.js';
+    import { rampColor, heatLegend, attachTooltip } from '/js/viz.js';
+
+    // ── Background scene + FX toggle (ambient — this page never queries
+    //    worker status, so the nav's live-dot/worker-count is omitted per
+    //    the shell spec; only the FX switch remains). ────────────────────
+    initScene(document.getElementById('bgScene'), { mode: 'ambient' });
+    const fxToggle = document.querySelector('[data-fx-toggle]');
+    fxToggle.textContent = fxEnabled() ? 'FX on' : 'FX off';
+    fxToggle.addEventListener('click', toggleFx);
+
+    try {
+      document.getElementById('dialogClose').innerHTML = icon('x');
+    } catch (e) {
+      // Never let a broken icon glyph take the whole page's init down with it.
+      document.getElementById('dialogClose').textContent = '×';
+    }
+
+    // ── Headline ──────────────────────────────────────────────────────────
+
+    async function loadHeadline() {
+      const el = document.getElementById('headline');
+      try {
+        const [all, strong, validated, planet] = await Promise.all([
+          getJSON('/api/candidates?limit=1'),
+          getJSON('/api/candidates?limit=1&filter=strong'),
+          getJSON('/api/candidates?limit=1&filter=validated'),
+          getJSON('/api/candidates?limit=1&filter=planet'),
+        ]);
+        const total = all.total ?? (all.candidates || all).length;
+        const nStrong = strong.total ?? 0;
+        const nValidated = validated.total ?? 0;
+        const nPlanet = planet.total ?? 0;
+        const planetWord = nPlanet === 1 ? 'candidate' : 'candidates';
+        el.innerHTML = stat(
+          'Candidates',
+          fmtInt(total),
+          `${fmtInt(nStrong)} strong · ${fmtInt(nValidated)} validated · `
+          + `${fmtInt(nPlanet)} planet ${planetWord} flagged by Claude`,
+        );
+      } catch (e) {
+        el.innerHTML = stat('Candidates', '—', 'Could not load candidate counts.');
+      }
+    }
+
+    // ── Candidates table ─────────────────────────────────────────────────
+
+    let candOffset = 0;
+    const CAND_PAGE = 10;
+    let candTotal = 0;
+
+    function verdictTag(v) {
+      if (v === 'planet_candidate') return tag('strong', 'ok');
+      if (v === 'uncertain') return tag('uncertain', 'outline');
+      if (v === 'likely_false_positive') return tag('likely false positive', 'neutral');
+      return '<span class="text-muted">—</span>';
+    }
+
+    function candRow(c) {
+      return `<tr data-tic="${esc(c.tic_id)}">
+        <td class="num">${esc(c.tic_id)}</td>
+        <td class="num">${fmtNum(c.period_days, 3)}</td>
+        <td class="num">${fmtNum(c.depth_ppm, 0)}</td>
+        <td class="num">${fmtNum(c.snr, 1)}</td>
+        <td class="num">${fmtNum(c.cnn_score, 3)}</td>
+        <td class="num">${fmtNum(c.triceratops_fpp, 3)}</td>
+        <td>${verdictTag(c.claude_verdict)}</td>
+      </tr>`;
+    }
+
+    // One malformed row (unexpected field type/shape from the backend) must
+    // not blank the whole table — render that row as an inline error cell
+    // and keep going, instead of letting .map() throw and lose every row.
+    function safeCandRow(c) {
+      try {
+        return candRow(c);
+      } catch (e) {
+        return `<tr><td colspan="7" class="text-muted">Row error (TIC ${esc(c && c.tic_id)}): ${esc(e.message)}</td></tr>`;
+      }
+    }
+
+    function candUrl() {
+      const search = document.getElementById('candSearch').value.trim();
+      const filter = document.getElementById('candFilter').value;
+      const sort = document.getElementById('candSort').value;
+      let url = `/api/candidates?limit=${CAND_PAGE}&offset=${candOffset}&sort=${sort}`;
+      if (filter !== 'all') url += `&filter=${filter}`;
+      if (search) url += `&tic_id=${encodeURIComponent(search)}`;
+      return url;
+    }
+
+    async function loadCandidates() {
+      const tbody = document.getElementById('candidatesBody');
+      try {
+        const d = await getJSON(candUrl());
+        const cands = d.candidates || d;
+        candTotal = d.total ?? cands.length;
+        tbody.innerHTML = cands.length
+          ? cands.map(safeCandRow).join('')
+          : '<tr><td colspan="7" class="text-muted">No candidates match this filter.</td></tr>';
+        document.getElementById('candPageInfo').textContent = candTotal === 0
+          ? '0 of 0'
+          : `${candOffset + 1}-${Math.min(candOffset + CAND_PAGE, candTotal)} of ${fmtInt(candTotal)}`;
+        document.getElementById('candPrev').disabled = candOffset <= 0;
+        document.getElementById('candNext').disabled = candOffset + CAND_PAGE >= candTotal;
+      } catch (e) {
+        tbody.innerHTML = `<tr><td colspan="7"><div class="card card-alert"><p>Could not load candidates: ${esc(e.message)}</p></div></td></tr>`;
+      }
+    }
+
+    ['candFilter', 'candSort'].forEach((id) => {
+      document.getElementById(id).addEventListener('change', () => { candOffset = 0; loadCandidates(); });
+    });
+    document.getElementById('candSearch').addEventListener('input', () => { candOffset = 0; loadCandidates(); });
+    document.getElementById('candPrev').addEventListener('click', () => {
+      candOffset = Math.max(0, candOffset - CAND_PAGE);
+      loadCandidates();
+    });
+    document.getElementById('candNext').addEventListener('click', () => {
+      candOffset = Math.min(candOffset + CAND_PAGE, Math.max(0, candTotal - CAND_PAGE));
+      loadCandidates();
+    });
+    document.getElementById('candidatesBody').addEventListener('click', (e) => {
+      const tr = e.target.closest('tr[data-tic]');
+      if (tr) openDetail(tr.dataset.tic);
+    });
+
+    // ── Candidate detail dialog (owns detail + phase-fold, was duplicated
+    //    between index.html and results.html — consolidated here) ────────
+
+    const backdrop = document.getElementById('dialogBackdrop');
+
+    function closeDialog() { backdrop.hidden = true; }
+    backdrop.addEventListener('click', (e) => { if (e.target === backdrop) closeDialog(); });
+    document.getElementById('dialogClose').addEventListener('click', closeDialog);
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && !backdrop.hidden) closeDialog();
+    });
+
+    async function loadCrosscheck(ticId, candidateNum, container) {
+      container.innerHTML = '<p class="text-muted">Loading TOI cross-check&hellip;</p>';
+      try {
+        const data = await getJSON(`/api/ctoi/crosscheck/${encodeURIComponent(ticId)}`);
+        if (data.error) {
+          container.innerHTML = `<p class="text-muted">${esc(data.error)}</p>`;
+          return;
+        }
+        const entry = (data.candidates || []).find((c) => c.candidate_num === candidateNum);
+        if (!entry || !entry.toi_matches || !entry.toi_matches.length) {
+          container.innerHTML = tag('No TOI match — potential new cTOI', 'accent');
+          return;
+        }
+        container.innerHTML = entry.toi_matches.map((m) => {
+          const kind = m.is_known_planet ? 'ok' : (m.disposition === 'FP' ? 'neutral' : 'outline');
+          // tag() escapes the whole composed label below — no need to
+          // double-escape the pieces here.
+          const label = `TOI-${m.toi} · ${m.disposition || 'unknown'}`;
+          const extra = [];
+          if (m.known_period != null) extra.push(`P = ${fmtNum(m.known_period, 3)} d`);
+          if (m.period_match) extra.push(`period match (ratio ${fmtNum(m.period_ratio, 3)})`);
+          return `<div>${tag(label, kind)}${extra.length ? `<span class="text-muted"> ${esc(extra.join(' · '))}</span>` : ''}</div>`;
+        }).join('');
+      } catch (e) {
+        container.innerHTML = '<p class="text-muted">Could not load the TOI cross-check.</p>';
+      }
+    }
+
+    function detailRow(c, selected) {
+      return `
+        <tr data-cand="${c.candidate_num}" class="${c.candidate_num === selected.candidate_num ? 'row-active' : ''}">
+          <td class="num">#${c.candidate_num}</td>
+          <td class="num">${fmtNum(c.period_days, 3)}</td>
+          <td class="num">${fmtNum(c.depth_ppm, 0)}</td>
+          <td class="num">${fmtNum(c.snr, 1)}</td>
+          <td class="num">${fmtNum(c.cnn_score, 3)}</td>
+          <td class="num">${fmtNum(c.triceratops_fpp, 3)}</td>
+          <td>${verdictTag(c.claude_verdict)}</td>
+        </tr>`;
+    }
+
+    function renderDetail(ticId, list, selected) {
+      document.getElementById('dialogTitle').textContent = `TIC ${ticId}`;
+      const body = document.getElementById('dialogBody');
+      const rows = list.map((c) => {
+        try {
+          return detailRow(c, selected);
+        } catch (e) {
+          return `<tr><td colspan="7" class="text-muted">Row error: ${esc(e.message)}</td></tr>`;
+        }
+      }).join('');
+      body.innerHTML = `
+        <img id="detailPlot" src="/api/ctoi/plot/${encodeURIComponent(ticId)}/${selected.candidate_num}"
+             alt="Phase-folded transit — TIC ${esc(ticId)} candidate ${selected.candidate_num}">
+        ${selected.claude_analysis ? `<p class="text-muted">${esc(selected.claude_analysis)}</p>` : ''}
+        <h4>Candidates for this TIC</h4>
+        <div class="table-wrap">
+          <table class="table table-clickable">
+            <thead><tr><th>#</th><th>Period (d)</th><th>Depth (ppm)</th><th>SNR</th><th>CNN</th><th>FPP</th><th>Verdict</th></tr></thead>
+            <tbody id="detailCandBody">${rows}</tbody>
+          </table>
+        </div>
+        <h4>TOI cross-check</h4>
+        <div id="crosscheckBox"><p class="text-muted">Loading&hellip;</p></div>
+      `;
+      document.getElementById('detailPlot').addEventListener('error', function onErr() {
+        this.replaceWith(Object.assign(document.createElement('p'), {
+          className: 'text-muted',
+          textContent: 'Plot generation failed — no FITS data available.',
+        }));
+      }, { once: true });
+      document.getElementById('detailCandBody').addEventListener('click', (e) => {
+        const tr = e.target.closest('tr[data-cand]');
+        if (!tr) return;
+        const num = parseInt(tr.dataset.cand, 10);
+        const next = list.find((c) => c.candidate_num === num);
+        if (next) renderDetail(ticId, list, next);
+      });
+      loadCrosscheck(ticId, selected.candidate_num, document.getElementById('crosscheckBox'));
+    }
+
+    async function openDetail(ticId, candidateNum) {
+      backdrop.hidden = false;
+      document.getElementById('dialogTitle').textContent = `TIC ${ticId}`;
+      document.getElementById('dialogBody').innerHTML = '<p class="text-muted">Loading&hellip;</p>';
+      try {
+        const data = await getJSON(`/api/candidates?tic_id=${encodeURIComponent(ticId)}`);
+        const list = data.candidates || data;
+        if (!Array.isArray(list) || !list.length) {
+          document.getElementById('dialogBody').innerHTML = '<p>No candidates found for this TIC.</p>';
+          return;
+        }
+        let selected = candidateNum != null ? list.find((c) => c.candidate_num === candidateNum) : null;
+        if (!selected) selected = list.reduce((a, b) => ((a.snr || 0) > (b.snr || 0) ? a : b));
+        renderDetail(ticId, list, selected);
+      } catch (e) {
+        document.getElementById('dialogBody').innerHTML =
+          `<div class="card card-alert"><p>Could not load TIC ${esc(ticId)}: ${esc(e.message)}</p></div>`;
+      }
+    }
+
+    // ── Scorecards browser (generic JSON renderer + discovery layout) ──────
+
+    const SC_HEADLINE_KEYS = new Set([
+      'campaign', 'sector', 'lot', 'date', 'n_stars', 'stars_processed',
+      'primary_done', 'primary_failed', 'candidate_rows',
+      'distinct_tics_with_candidate', 'v6_ge_0.5', 'clean_planets',
+      'strong_gate_passed', 'generated_at', 'sample', 'n_tics',
+      'n_with_tces', 'n_without_dv',
+      'total_planets_expected', 'total_planets_matched', 'recall_per_planet',
+      'recall', 'recall_detectable', 'precision', 'specificity', 'auc',
+      'n_systems', 'with_v6', 'with_fpp', 'with_exominer_spoc',
+    ]);
+    const SC_SUMMARY_KEYS = new Set(['summary', 'all', 'overall', 'totals', 'aggregate']);
+
+    function isScalar(v) { return v === null || v === undefined || typeof v !== 'object'; }
+    function isFlatDict(v) {
+      return v && typeof v === 'object' && !Array.isArray(v)
+        && Object.values(v).every((x) => isScalar(x) || (Array.isArray(x) && x.every(isScalar)));
+    }
+    function isDictOfDicts(v) {
+      if (!v || typeof v !== 'object' || Array.isArray(v)) return false;
+      const vals = Object.values(v);
+      return vals.length > 0 && vals.every(isFlatDict);
+    }
+
+    function fmtScalar(v) {
+      if (v === null || v === undefined || v === '') return '—';
+      if (typeof v === 'boolean') return v ? 'yes' : 'no';
+      if (typeof v === 'number') return Number.isInteger(v) ? fmtInt(v) : fmtNum(v, Math.abs(v) < 1 ? 3 : 2);
+      return esc(String(v));
+    }
+    function label(k) { return esc(k.replace(/_/g, ' ')); }
+
+    function renderValue(v) {
+      if (isScalar(v)) return `<span class="kv-val">${fmtScalar(v)}</span>`;
+      if (Array.isArray(v)) {
+        if (!v.length) return '<span class="kv-val text-muted">none</span>';
+        if (v.every(isScalar)) return `<span class="kv-val">${v.map(fmtScalar).join(', ')}</span>`;
+        return renderArrayOfObjects(v);
+      }
+      if (isDictOfDicts(v)) return renderDictOfDicts(v);
+      return renderDict(v);
+    }
+
+    function renderDictOfDicts(obj) {
+      const entries = Object.entries(obj);
+      const cols = [...new Set(entries.flatMap(([, v]) => Object.keys(v)))];
+      return `<div class="table-wrap"><table class="table">
+        <thead><tr><th></th>${cols.map((c) => `<th>${label(c)}</th>`).join('')}</tr></thead>
+        <tbody>${entries.map(([k, v]) => `<tr><th>${label(k)}</th>${cols.map((c) => `<td>${fmtScalar(v[c])}</td>`).join('')}</tr>`).join('')}</tbody>
+      </table></div>`;
+    }
+
+    function renderDict(obj) {
+      const entries = Object.entries(obj);
+      if (!entries.length) return '<span class="kv-val text-muted">—</span>';
+      const flat = ([, v]) => isScalar(v) || (Array.isArray(v) && v.every(isScalar));
+      const scalars = entries.filter(flat);
+      const nested = entries.filter((e) => !flat(e));
+      let out = '';
+      if (scalars.length) {
+        out += `<div class="kv-grid">${scalars.map(([k, v]) => `<div class="kv-row"><span class="kv-key">${label(k)}</span>${renderValue(v)}</div>`).join('')}</div>`;
+      }
+      out += nested.map(([k, v]) => `<div class="nested"><div class="nested-key">${label(k)}</div><div class="nested-body">${renderValue(v)}</div></div>`).join('');
+      return out;
+    }
+
+    function renderArrayOfObjects(arr) {
+      const nested = arr.some((o) => o && typeof o === 'object' && Object.values(o).some((x) => x && typeof x === 'object'));
+      if (!nested) {
+        const cols = [...new Set(arr.flatMap((o) => Object.keys(o)))];
+        const rows = arr.slice(0, 25);
+        return `<div class="table-wrap"><table class="table">
+          <thead><tr>${cols.map((c) => `<th>${label(c)}</th>`).join('')}</tr></thead>
+          <tbody>${rows.map((r) => `<tr>${cols.map((c) => `<td>${fmtScalar(r[c])}</td>`).join('')}</tr>`).join('')}</tbody>
+        </table>${arr.length > 25 ? `<p class="text-muted">${fmtInt(arr.length - 25)} more rows&hellip;</p>` : ''}</div>`;
+      }
+      return arr.map((o) => {
+        const scalars = Object.entries(o).filter(([, v]) => isScalar(v) || (Array.isArray(v) && v.every(isScalar)));
+        const objs = Object.entries(o).filter(([, v]) => v && typeof v === 'object' && !(Array.isArray(v) && v.every(isScalar)));
+        const head = scalars.map(([k, v]) => `<span class="chip"><span class="chip-k">${label(k)}</span>${fmtScalar(v)}</span>`).join('');
+        const bodyHtml = objs.map(([k, v]) => `<div class="nested"><div class="nested-key">${label(k)}</div><div class="nested-body">${renderValue(v)}</div></div>`).join('');
+        return `<div class="row-card">${head ? `<div class="chips">${head}</div>` : ''}${bodyHtml}</div>`;
+      }).join('');
+    }
+
+    function isDiscoveryScorecard(data) {
+      return data && data.metrics && typeof data.metrics === 'object'
+        && ('lot' in data.metrics || 'recall_global' in data.metrics || data.stratification === 'discovery');
+    }
+
+    // Schema v1 vs v2 (2026-07-14). v2 splits recall into metrics.lot (this
+    // run) and metrics.cumulative (the whole DB). v1 had a single flat
+    // metrics.recall_global that was ALWAYS the cumulative figure, read by
+    // everyone as if it were the run's own result. Historical cards are
+    // still browsable here, so map them honestly: v1 gets a cumulative
+    // figure and no lot figure, because it never measured one.
+    function scRecallBlocks(m) {
+      if (m.lot || m.cumulative) return { lot: m.lot || null, cum: m.cumulative || null };
+      return {
+        lot: null,
+        cum: {
+          recall: m.recall_global,
+          n_detected: m.n_detected,
+          n_kp_cp: m.n_kp_cp_processed,
+          measurable: typeof m.recall_global === 'number',
+        },
+      };
+    }
+
+    function parseStrongFromDossier(txt) {
+      const m = txt.match(/Strong candidates[^:\n]*:\s*(\d+)/i);
+      const count = m ? parseInt(m[1], 10) : null;
+      const lines = txt.split('\n');
+      const tbl = [];
+      for (let i = 0; i < lines.length; i++) {
+        if (lines[i].trim().startsWith('|')) {
+          while (i < lines.length && lines[i].trim().startsWith('|')) tbl.push(lines[i++]);
+          break;
+        }
+      }
+      const cells = (l) => l.split('|').slice(1, -1).map((c) => c.trim());
+      const headers = tbl.length ? cells(tbl[0]) : [];
+      const rows = tbl.length >= 3 ? tbl.slice(2).map(cells).filter((r) => r.some((c) => c)) : [];
+      return { count, headers, rows };
+    }
+
+    function renderStrongBox(count, headers, rows) {
+      if (!count && !rows.length) return '<p class="text-muted">No strong candidates in this run.</p>';
+      const n = count != null ? count : rows.length;
+      const table = rows.length
+        ? `<div class="table-wrap"><table class="table">
+            <thead><tr>${headers.map((h) => `<th>${esc(h)}</th>`).join('')}</tr></thead>
+            <tbody>${rows.map((r) => `<tr>${r.map((c) => `<td>${esc(c)}</td>`).join('')}</tr>`).join('')}</tbody>
+          </table></div>` : '';
+      return `<div class="card card-accent-2"><p><strong>${fmtInt(n)} strong candidate${n === 1 ? '' : 's'}</strong> (v6 &gt; 0.5, post-veto)</p>${table}</div>`;
+    }
+
+    async function loadStrongCandidates(name) {
+      const box = document.getElementById('scStrong');
+      if (!box) return;
+      try {
+        const data = await getJSON(`/api/scorecards/${encodeURIComponent(name)}/dossier`);
+        const { count, headers, rows } = parseStrongFromDossier(data.text || '');
+        box.innerHTML = (count === null && !rows.length) ? '' : renderStrongBox(count, headers, rows);
+      } catch (e) {
+        box.innerHTML = '';
+      }
+    }
+
+    function meterGroup(title, obj) {
+      const rows = Object.entries(obj).map(([k, v]) => {
+        // meter() prints `${width}%` verbatim (see ui.js) — round to 1
+        // decimal here or a raw fraction*100 (e.g. 84.33734939759037) spills
+        // a long decimal tail into the row instead of "84.3%".
+        const raw = typeof v === 'number' ? Math.max(0, Math.min(100, v * 100)) : 0;
+        const pct = Math.round(raw * 10) / 10;
+        return meter(k, pct, { done: typeof v === 'number' && v >= 0.8 });
+      }).join('');
+      return `<div class="subcard"><h4>${esc(title)}</h4>${rows}</div>`;
+    }
+
+    function kvGroup(title, rows) {
+      const body = rows.map(([k, v]) => `<div class="kv-row"><span class="kv-key">${esc(k)}</span><span class="kv-val">${v}</span></div>`).join('');
+      return `<div class="subcard"><h4>${esc(title)}</h4><div class="kv-grid">${body}</div></div>`;
+    }
+
+    function renderDiscoveryScorecard(data) {
+      const m = data.metrics || {};
+      const ex = m.exominer || {};
+      const cov = data.coverage || {};
+      const sec = (String(data.run_id || '').match(/s0*(\d+)/) || [])[1];
+      const date = String(data.generated_at || '').slice(0, 10);
+
+      let html = `<p><strong>${esc(data.run_id || 'scorecard')}</strong>
+        <span class="text-muted">${sec ? `sector ${esc(sec)} · ` : ''}${esc(date)}${data.pipeline_version ? ` · ${esc(data.pipeline_version)}` : ''}</span></p>`;
+
+      html += '<div id="scStrong"></div>';
+
+      const rc = scRecallBlocks(m);
+      const lot = rc.lot;
+      const cum = rc.cum || {};
+      const lotCard = (lot && lot.measurable)
+        ? stat('Recall — lot (this run)', fmtPct(lot.recall), `${fmtInt(lot.n_detected)} / ${fmtInt(lot.n_kp_cp)} KP/CP in the lot`)
+        : stat('Recall — lot (this run)', 'n/a', lot ? 'No KP/CP in the lot — not measurable' : 'Schema v1: this scorecard did not measure the lot');
+
+      html += '<div class="stat-grid">' + [
+        lotCard,
+        stat('Recall — cumulative (whole DB)', fmtPct(cum.recall), `${fmtInt(cum.n_detected)} / ${fmtInt(cum.n_kp_cp)} · does not validate this run`),
+        stat('ExoMiner recall', fmtPct(ex.recall_combined), `Docker ${fmtPct(ex.recall_docker)} · FFI ${fmtPct(ex.recall_ffi)}`),
+        stat('Coverage', fmtPct(cov.with_candidate), `${fmtPct(cov.completed)} processed`),
+        stat('False positives', fmtInt(m.n_fp_processed), `CNN veto ${fmtPct(m.fp_rate_cnn)} · Claude ${fmtPct(m.fp_rate_claude)}`),
+      ].join('') + '</div>';
+
+      const bd = [
+        ['Recall by period', m.recall_by_period],
+        ['Recall by depth (ppm)', m.recall_by_depth],
+        ['Recall by sectors', m.recall_by_sectors],
+      ].filter(([, v]) => v && typeof v === 'object' && !Array.isArray(v));
+      html += bd.map(([t, v]) => meterGroup(t, v)).join('');
+
+      if (Object.keys(ex).length) {
+        html += kvGroup(
+          `ExoMiner — ${fmtInt(ex.n_kp_cp_processed)} KP/CP · ${fmtInt(ex.n_fp_fa_processed)} FP/FA (thr ${ex.threshold ?? '—'})`,
+          [
+            ['Recall — Docker', fmtPct(ex.recall_docker)],
+            ['Recall — FFI', fmtPct(ex.recall_ffi)],
+            ['Recall — Combined', fmtPct(ex.recall_combined)],
+            ['Specificity — Docker', fmtPct(ex.specificity_docker)],
+            ['Specificity — FFI', fmtPct(ex.specificity_ffi)],
+            ['KP/CP null (em / ffi)', `${fmtInt(ex.kp_cp_em_null)} / ${fmtInt(ex.kp_cp_ffi_null)}`],
+            ['FP/FA null (em / ffi)', `${fmtInt(ex.fp_fa_em_null)} / ${fmtInt(ex.fp_fa_ffi_null)}`],
+          ],
+        );
+      }
+
+      const prec = [['Period', m.period_precision], ['Depth', m.depth_precision], ['Duration', m.duration_precision]]
+        .filter(([, v]) => v && typeof v === 'object');
+      if (prec.length) {
+        html += kvGroup('Transit precision (median relative error)', prec.map(([k, v]) => [
+          k, `${fmtPct(v.median_rel_err)} <span class="text-muted">±${typeof v.sigma === 'number' ? fmtPct(v.sigma) : '—'} · n=${fmtInt(v.n)}</span>`,
+        ]));
+      }
+
+      html += `<details class="raw-json"><summary>Show raw JSON</summary><pre>${esc(JSON.stringify(data, null, 2))}</pre></details>`;
+      return html;
+    }
+
+    function renderScorecardData(data) {
+      if (!data || typeof data !== 'object' || Array.isArray(data)) {
+        return '<div class="card card-alert"><p>Unexpected scorecard format.</p></div>';
+      }
+      if (isDiscoveryScorecard(data)) return renderDiscoveryScorecard(data);
+
+      const headlineCards = [];
+      const details = [];
+      const subsections = [];
+      for (const [k, v] of Object.entries(data)) {
+        if (isScalar(v)) (SC_HEADLINE_KEYS.has(k) ? headlineCards : details).push([k, v]);
+        else if (Array.isArray(v) && v.every(isScalar)) details.push([k, v]);
+        else subsections.push([k, v]);
+      }
+      if (!headlineCards.length) {
+        const si = subsections.findIndex(([k, v]) => SC_SUMMARY_KEYS.has(k) && isFlatDict(v));
+        if (si !== -1) {
+          const summary = subsections.splice(si, 1)[0][1];
+          for (const [k, v] of Object.entries(summary)) (isScalar(v) ? headlineCards : details).push([k, v]);
+        }
+      }
+
+      let html = '';
+      if (headlineCards.length) {
+        html += `<div class="stat-grid">${headlineCards.map(([k, v]) => stat(k.replace(/_/g, ' '), fmtScalar(v))).join('')}</div>`;
+      }
+      if (details.length) {
+        html += `<div class="subcard"><h4>Details</h4><div class="kv-grid">${details.map(([k, v]) => `<div class="kv-row"><span class="kv-key">${label(k)}</span>${renderValue(v)}</div>`).join('')}</div></div>`;
+      }
+      for (const [k, v] of subsections) {
+        html += `<div class="subcard"><h4>${label(k)}</h4>${renderValue(v)}</div>`;
+      }
+      html += `<details class="raw-json"><summary>Show raw JSON</summary><pre>${esc(JSON.stringify(data, null, 2))}</pre></details>`;
+      return html;
+    }
+
+    async function loadScorecard(name) {
+      const box = document.getElementById('scorecardContent');
+      if (!name) {
+        box.innerHTML = '<p class="text-muted">Select a scorecard above.</p>';
+        return;
+      }
+      box.innerHTML = '<p class="text-muted">Loading&hellip;</p>';
+      try {
+        const data = await getJSON(`/api/scorecards/${encodeURIComponent(name)}`);
+        box.innerHTML = renderScorecardData(data);
+        if (isDiscoveryScorecard(data)) loadStrongCandidates(name);
+      } catch (e) {
+        box.innerHTML = `<div class="card card-alert"><p>Could not load this scorecard: ${esc(e.message)}</p></div>`;
+      }
+    }
+
+    async function loadScorecardList() {
+      const sel = document.getElementById('scorecardSelect');
+      try {
+        const list = await getJSON('/api/scorecards');
+        if (!Array.isArray(list) || !list.length) {
+          sel.innerHTML = '<option value="">No scorecards available</option>';
+          document.getElementById('scorecardContent').innerHTML = '<p class="text-muted">No scorecards available yet.</p>';
+          return;
+        }
+        sel.innerHTML = list.map((sc) => {
+          // One malformed list entry (missing name/date) must not blank the
+          // whole dropdown — skip that entry with an inline note instead of
+          // letting .map() throw and lose every scorecard.
+          try {
+            const s = sc.summary || {};
+            let hint = '';
+            if (s.campaign) hint = ` — ${s.campaign}`;
+            else if (s.sample) hint = ` — ${String(s.sample).split('/').pop().replace('.csv', '')}`;
+            if (s.clean_planets !== undefined) hint += `, ${fmtInt(s.clean_planets)} planet(s)`;
+            if (s.n_tics) hint += `, ${fmtInt(s.n_tics)} TICs`;
+            const optLabel = `${sc.name.replace('.json', '')} (${sc.date})${hint}`;
+            return `<option value="${esc(sc.name)}">${esc(optLabel)}</option>`;
+          } catch (e) {
+            return '';
+          }
+        }).join('');
+        await loadScorecard(sel.value);
+      } catch (e) {
+        sel.innerHTML = '<option value="">Error loading scorecards</option>';
+        document.getElementById('scorecardContent').innerHTML = '<div class="card card-alert"><p>Could not load the scorecard list.</p></div>';
+      }
+    }
+    document.getElementById('scorecardSelect').addEventListener('change', (e) => loadScorecard(e.target.value));
+
+    // ── Detection completeness heatmap (spec §6.2 — the redesign's central
+    //    fix: rampColor(√prob) over the validated 8-step "starlight" ramp
+    //    instead of a single-hue opacity hack) ──────────────────────────────
+
+    let heatShowingTable = false;
+    const heatTableToggle = document.getElementById('heatTableToggle');
+    heatTableToggle.addEventListener('click', () => {
+      heatShowingTable = !heatShowingTable;
+      document.getElementById('heatmapBox').hidden = heatShowingTable;
+      document.getElementById('heatmapLegend').hidden = heatShowingTable;
+      document.getElementById('heatmapTable').hidden = !heatShowingTable;
+      heatTableToggle.textContent = heatShowingTable ? 'Grid view' : 'Table view';
+    });
+
+    function heatCellTooltip(el) {
+      const p = el.dataset.p;
+      const r = el.dataset.r;
+      const prob = el.dataset.prob;
+      if (prob === '') return `P ${esc(p)} d · R ${esc(r)} R⊕ · no injections`;
+      return `P ${esc(p)} d · R ${esc(r)} R⊕ · detection ${fmtPct(parseFloat(prob))}`;
+    }
+
+    async function loadHeatmap() {
+      const box = document.getElementById('heatmapBox');
+      const legendBox = document.getElementById('heatmapLegend');
+      const tableBox = document.getElementById('heatmapTable');
+      try {
+        const data = await getJSON('/api/completeness');
+        if (!data.length) {
+          box.innerHTML = '<p class="empty">No completeness data yet — injection-recovery has not run.</p>';
+          legendBox.innerHTML = '';
+          tableBox.innerHTML = '';
+          heatTableToggle.hidden = true;
+          return;
+        }
+        heatTableToggle.hidden = false;
+
+        const radii = [...new Set(data.map((d) => d.radius_earth))].sort((a, b) => b - a);
+        const periods = [...new Set(data.map((d) => d.period_days))].sort((a, b) => a - b);
+        const lookup = {};
+        data.forEach((d) => { lookup[`${d.radius_earth}_${d.period_days}`] = d.avg_prob; });
+
+        // Real avg_prob values cluster low (roughly 0.03-0.5, see
+        // /api/completeness). sqrt(prob) opens that low end up before it
+        // feeds the ramp, same as before — the fix is that the ramp itself
+        // is now 8 perceptually-uniform steps (js/viz.js rampColor), not one
+        // hue's opacity.
+        function cellHtml(r, p) {
+          const prob = lookup[`${r}_${p}`];
+          const hasData = prob != null;
+          const bg = hasData ? rampColor(Math.sqrt(Math.max(0, Math.min(1, prob)))) : 'transparent';
+          const extra = hasData ? '' : 'border:1px solid var(--line);';
+          return `<span tabindex="0" data-r="${esc(String(r))}" data-p="${esc(String(p))}"
+            data-prob="${hasData ? prob : ''}" style="background-color:${bg};${extra}"></span>`;
+        }
+
+        const rows = radii.map((r) => {
+          let cells;
+          try {
+            cells = periods.map((p) => cellHtml(r, p)).join('');
+          } catch (e) {
+            cells = '<span class="text-muted" title="row error">?</span>';
+          }
+          return `<div class="heat-row"><span class="heat-row-label">${esc(String(r))} R⊕</span><div class="heat">${cells}</div></div>`;
+        }).join('');
+
+        // Bottom axis reuses .heat-row/.heat-row-label so its columns line
+        // up with the grid above (same 54px label offset + gap).
+        const axisTicks = periods.map((p) => `<span>${esc(String(p))} d</span>`).join('');
+        const axis = `<div class="heat-row"><span class="heat-row-label"></span>
+          <div class="heat-axis" style="flex:1">${axisTicks}</div></div>`;
+
+        box.innerHTML = `<div class="heat-rows">${rows}</div>${axis}`;
+        heatLegend(legendBox, { scale: 'sqrt' });
+
+        box.querySelectorAll('.heat span[tabindex]').forEach((cell) => attachTooltip(cell, heatCellTooltip));
+
+        // Table-view fallback (spec §6.2: accessibility / CVD relief).
+        const thead = `<tr><th>Radius (R⊕)</th>${periods.map((p) => `<th>${esc(String(p))} d</th>`).join('')}</tr>`;
+        const tbody = radii.map((r) => {
+          const cells = periods.map((p) => {
+            const prob = lookup[`${r}_${p}`];
+            return `<td class="num">${prob != null ? fmtPct(prob) : '—'}</td>`;
+          }).join('');
+          return `<tr><th class="num">${esc(String(r))}</th>${cells}</tr>`;
+        }).join('');
+        tableBox.innerHTML = `<div class="table-wrap"><table class="table">
+          <thead>${thead}</thead><tbody>${tbody}</tbody></table></div>`;
+      } catch (e) {
+        box.innerHTML = '<p class="empty">Could not load completeness data.</p>';
+        legendBox.innerHTML = '';
+        tableBox.innerHTML = '';
+        heatTableToggle.hidden = true;
+      }
+    }
+
+    // ── Toolbar: exports ─────────────────────────────────────────────────
+    //
+    // /api/ctoi/export has no row cap (unlike /api/export/*'s 50k cap) — at
+    // the current DB scale it returns 1.18M rows / ~143 MB (verified against
+    // the live server 2026-07-24). A client-side fetch+parse for a live
+    // "N ready / N new" count — however faithfully it kept the manual
+    // column-index parsing from the old page — would re-download that
+    // payload on every load and on the 15 s poll, freezing the tab. So this
+    // page only *links* to the export (browser-native streaming download,
+    // one min-SNR threshold at a time) and never fetches its body.
+
+    document.getElementById('ctoiMinSnr').addEventListener('change', (e) => {
+      document.getElementById('ctoiExportLink').href = `/api/ctoi/export?min_snr=${e.target.value}`;
+    });
+
+    // ── Init + periodic refresh ──────────────────────────────────────────
+    // Scorecard browser loads once (not on the poll), matching the old
+    // page's behavior — everything else refreshes every 15 s.
+
+    async function refreshAll() {
+      await Promise.all([
+        loadHeadline(),
+        loadCandidates(),
+        loadHeatmap(),
+      ]);
+    }
+
+    loadScorecardList();
+    const handle = poll(refreshAll, 15000);
+    staleNote(document.getElementById('staleNote'), handle);
+  </script>
+</body>
+</html>

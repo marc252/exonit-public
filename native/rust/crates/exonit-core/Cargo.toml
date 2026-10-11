@@ -1,0 +1,192 @@
+[package]
+name = "exonit-core"
+version.workspace = true
+edition.workspace = true
+# `sycl`/`ispc` features shell out to external toolchains (icpx/ispc) from
+# `build.rs` — see that file's module doc comment. Neither has a crates.io
+# binding crate, so there is no `[dependencies]` entry for either; the
+# build script is the only thing that changes when these features flip.
+build = "build.rs"
+
+# Build-time only (never linked into the shipped binary) -- used EXCLUSIVELY
+# by `build.rs`'s Windows `ispc` archiving step to locate MSVC's `lib.exe`
+# via `cc::windows_registry::find` (the same registry/vswhere-based
+# discovery `cc`, `cmake`, and effectively every native-Windows-Rust crate
+# uses; hardcoding a `Program Files\...\VC\Tools\MSVC\<version>\bin\...`
+# path here would silently break on the next VS Build Tools update). Not a
+# NEW supply-chain addition in practice: `cc` v1.4.0 is already pulled in
+# transitively as a build-dependency of `ring` (see Cargo.lock) -- this
+# entry just names the version workspace-wide instead of relying on
+# whatever `ring` happens to require.
+[build-dependencies]
+cc = "1.4.0"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+libc.workspace = true
+ureq.workspace = true
+rusqlite.workspace = true
+ort.workspace = true
+# F7 — see the workspace Cargo.toml's `rayon` entry for the full rationale.
+rayon.workspace = true
+# Casaubuntu (AMD Vega, Mesa rusticl) / <host> (Intel Arc) injection-recovery
+# OpenCL batch backend — optional: only pulled in by the `opencl` feature
+# below. See the workspace Cargo.toml's `ocl` entry for the exact rationale.
+ocl = { workspace = true, optional = true }
+
+# F4a `cudarc` — optional, only pulled in by the `cuda` feature (see
+# `[features]` below). Target-cfg SPLIT (not `workspace = true`) because the
+# `cuda-XXXXX` version feature selects a compile-time-baked
+# `CUDA_MAJOR_VERSION`/`CUDA_MINOR_VERSION` pair that also drives the
+# candidate DLL/SO filenames `dynamic-loading` searches for (see
+# `cudarc::get_lib_name_candidates` — NOT just a struct-layout choice, as
+# the workspace Cargo.toml's original comment assumed before this was
+# found):
+#   - Unix (<host>): `cuda-12080` — matches its installed
+#     `libnvrtc.so.12`-family runtime (pip `nvidia-cuda-nvrtc-cu12`).
+#   - Windows (<host>): `cuda-13020` — found via Task 4
+#     (docs/plans/2026-08-06-win32-port-pcmarc.md) needing the ACTUAL
+#     toolkit installed there, CUDA 13.2 (`nvrtc64_130_0.dll`). Using
+#     `cuda-12080` on <host> made `CudaBlsBackend::probe()` fail outright —
+#     NONE of its generated candidates start with "13" — even though
+#     `nvcuda.dll` (the driver, versionless) was present and the GPU (RTX
+#     4070, sm_89) is well within both 12.8's and 13.2's supported range.
+#     Any `cuda-130X0` feature produces the same candidate set for THIS
+#     purpose (`get_lib_name_candidates`'s `{major}0_0` pattern is
+#     minor-agnostic — literally hardcodes "0" as the middle digit
+#     regardless of the true installed minor version, matching NVIDIA's own
+#     per-major-CUDA-line DLL naming convention); `cuda-13020` was picked to
+#     name the exact installed toolkit precisely rather than an arbitrary
+#     13.x pick.
+[target.'cfg(unix)'.dependencies]
+cudarc = { workspace = true, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+cudarc = { version = "0.19.8", default-features = false, optional = true, features = [
+    "driver",
+    "nvrtc",
+    "dynamic-loading",
+    "cuda-13020",
+    "std",
+] }
+# F0 Win32 port (Task 2, docs/plans/2026-08-06-win32-port-pcmarc.md):
+# `platform::windows`'s Win32 bindings + startup-lock file lock. Target-cfg
+# gated so the Linux/<host> build (<host>, production) never resolves
+# or compiles either crate — see the workspace Cargo.toml's entries for the
+# full rationale.
+windows-sys = { workspace = true }
+fs4 = { workspace = true }
+
+[features]
+default = []
+# F4 extension point (NOT enabled by default): passthrough to `ort`'s own
+# `cuda` feature (links the CUDA execution provider for ONNX — F4b/F3
+# territory, unused by F4a) plus `dep:cudarc` for the primary-BLS CUDA
+# kernels (F4a, see `bls/cuda.rs`). See `onnx_cnn.rs`/`onnx_exominer.rs`
+# module docs for the ONNX EP swap point; no other code in this crate needs
+# to change for either half. Compiles on <host> (no NVIDIA GPU: builds,
+# does not execute — `cudarc`'s `dynamic-loading` feature means no
+# libcuda/libnvrtc link-time dependency either); executes only on
+# <host> per docs/DESIGN.md's F4 section.
+cuda = ["ort/cuda", "dep:cudarc"]
+# 2026-08-07 F4b follow-up (<host>, RTX 5060 Ti / Blackwell sm_120):
+# NOT enabled by default, NOT part of `cuda` — opt-in ONLY, because it
+# changes `ort`'s linking strategy for the WHOLE binary, and that strategy
+# is host-specific (see below). Root cause this addresses: pyke's
+# `ort-artifacts` prebuilt CUDA binary (what plain `cuda` links, via `ort`'s
+# own `download-binaries` default feature) is hardcoded to
+# `-DCMAKE_CUDA_ARCHITECTURES=75;80;90` (confirmed by reading
+# github.com/pykeio/ort-artifacts's `src/build.ts` directly, 2026-08-07) —
+# no PTX fallback beyond compute_90, so it has NO kernel image at all for
+# compute 12.0 (Blackwell): every session construction succeeds but every
+# `session.run()` fails `cudaErrorNoKernelImageForDevice`
+# (`onnx_cnn.rs`'s "Real-hardware finding" doc comment, 2026-08-05). This
+# is a binary-distribution gap, not a `cuda`-feature or ORT-version gap —
+# bumping the `ort` crate version alone does NOT fix it, since
+# ort-artifacts' arch list is independent of the `ort` crate's own
+# versioning and still excludes sm_120 as of this writing.
+#
+# Fix: link dynamically (`dlopen` at runtime, via `ort`'s own
+# `load-dynamic` feature — see `ort-sys/build/main.rs`: `disable-linking`,
+# which `load-dynamic` implies, is checked FIRST in the build script and
+# short-circuits before pyke's static-download path ever runs, so this is
+# safe to combine with the workspace's `download-binaries` default; no
+# pyke binary is downloaded or linked when this feature is active) against
+# the OFFICIAL Microsoft `onnxruntime-linux-x64-gpu_cuda13-1.28.0.tgz`
+# release build instead — confirmed (via
+# github.com/microsoft/onnxruntime PR #29711, merged, and
+# `tools/ci_build/github/linux/build_linux_python_package.sh`) to be built
+# with `CUDA_ARCHS="75-real;80-real;86-real;89-real;90-real;100-real;
+# 120-real;120-virtual"` — i.e. it ships a NATIVE Blackwell (120-real)
+# cubin. Same ONNX Runtime version (1.28.0) as the pyke binary this
+# replaces, so no ORT C API version skew.
+#
+# Requires, at RUNTIME only (no build-time effect beyond this feature
+# flag): `ORT_DYLIB_PATH` pointing at the extracted release's
+# `lib/libonnxruntime.so`, and that `.so`'s own CUDA 13 runtime deps
+# (libcublas/libcublasLt/libcudart .so.13, libcudnn.so.9) resolvable via
+# `LD_LIBRARY_PATH` — `ort` reads `ORT_DYLIB_PATH` itself
+# (`src/environment.rs`), no code change needed here. See
+# `docs/RUNBOOK_NVIDIARACK.md` for the exact host paths and the gpuq-gated
+# validation command. UNIX-only entry point (`ort/load-dynamic` has no
+# platform restriction upstream, but this feature exists specifically for
+# <host>'s Blackwell card — <host>'s sm_89 4070 is already correctly
+# served by the default static pyke path, matching CUDA_ARCHS above, so it
+# does not need and should not use this feature).
+cuda-dylib = ["ort/load-dynamic"]
+# Injection-recovery OpenCL batch backend (see `bls/opencl_batch.rs`'s
+# module doc comment / docs/plans/2026-08-06-opencl-backend-<host>.md).
+# Independent of `cuda` — both compile together (`cargo build --features
+# "cuda opencl"`); `resolve_injection_backend` in `task_processor.rs`
+# prefers CUDA > OpenCL > CPU when both are compiled in and probe
+# successfully.
+opencl = ["dep:ocl"]
+# 2026-08-06 Spec 2 integration (<host>): SYCL injection-recovery batch
+# backend (`bls::sycl_batch`), promoted from Spike 1 after
+# `spikes/RESULTS_2026-08-06.md`'s real-measurement gate (>=15% end-to-end
+# vs OpenCL — measured +31-37%). No `dep:` entry: unlike `opencl`/`cuda`,
+# there is no crates.io SYCL binding crate — `build.rs`'s `build_sycl()`
+# shells out to icpx directly and links the compiled `.so`, gated entirely
+# on this feature flag (`CARGO_FEATURE_SYCL`) at build-script time. Kept
+# independent of `opencl`/`cuda` — all three compile together
+# (`cargo build --features "cuda opencl sycl"`);
+# `resolve_injection_backend` in `task_processor.rs` prefers CUDA > SYCL >
+# OpenCL > CPU when several are compiled in and probe successfully (SYCL
+# ranks above OpenCL because it measurably beat it on the SAME Arc iGPU
+# both backends target; CUDA still ranks first because it targets
+# different, NVIDIA-only hardware this crate has separately validated
+# against, not because of a SYCL-vs-CUDA performance comparison — the two
+# never compete for the same physical device in practice).
+sycl = []
+# 2026-08-06 Spec 2 integration (<host>): ISPC-accelerated CPU BLS
+# fold/bin/window-search kernel (`bls::ispc_fold`, called from
+# `bls::optimized::search_in_pool`), promoted from Spike 2 after
+# `spikes/RESULTS_2026-08-06.md`'s real-measurement gate (>=10% —
+# measured +55% to +235% across grid shapes and P/E-core clusters). No
+# `dep:` entry, same reasoning as `sycl` above — `build.rs`'s
+# `build_ispc()` shells out to the standalone `ispc` compiler and links a
+# small static archive. Independent of every other feature in this crate
+# (pure-CPU, no GPU interaction at all) — compiles and runs alongside any
+# combination of `cuda`/`opencl`/`sycl`.
+ispc = []
+
+[[example]]
+name = "cuda_injection_bench"
+required-features = ["cuda"]
+
+[[example]]
+name = "cuda_primary_bench"
+required-features = ["cuda"]
+
+[[example]]
+name = "sycl_injection_bench"
+required-features = ["sycl"]
+
+[[example]]
+name = "opencl_injection_bench"
+required-features = ["opencl"]
+
+[[example]]
+name = "cpu_injection_bench"
+required-features = ["ispc"]

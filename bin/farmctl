@@ -1,0 +1,928 @@
+#!/usr/bin/env python3
+"""farmctl — unified ops CLI for the ExoNit worker farm.
+
+Run on the server host (<host>). Reads `ops/workers.json` for the worker
+manifest and `worker/agent.py` on each host for actual lifecycle commands.
+
+Subcommands:
+
+    farmctl status [--detail]
+        Show online/offline + git_sha + flag_states for each worker.
+        Reads from /api/worker/list (heartbeat-driven, instantaneous).
+        With --detail, also calls agent.py status on each host (slower).
+
+    farmctl start [worker_name ...] [--all] [--phase scan|fpp] [--no-prune]
+        SSH + agent.py start <name> on each named worker, sized per --phase
+        (default scan): 'scan' uses each worker's `instances`, 'fpp' uses
+        `instances_fpp` (falls back to `instances` when absent). Idempotent —
+        only starts instances that aren't already running.
+        Sizing goes BOTH ways: instances running but NOT sized for this phase
+        are stopped first (`instances_fpp: 0` = "this host sits FPP out" — the
+        slow hosts, so they stop seeding the FPP straggler tail). --no-prune
+        restores the old additive-only behaviour. See
+        docs/superpowers/specs/fleet-autoscale-by-phase.md.
+
+    farmctl stop [worker_name ...] [--all] [--force]
+        SSH + agent.py stop on each named worker, covering every instance
+        name ANY phase could have started (scan ∪ fpp) — not phase-scoped,
+        so a scale-up during FPP_BACKFILL is always fully torn down.
+
+    farmctl restart [worker_name ...] [--all] [--phase scan|fpp]
+        Stop then start. Useful after `deploy`.
+
+    farmctl deploy [worker_name ...] [--all] [--branch BRANCH]
+        Pull the latest commit on each worker. For git-tracked hosts:
+        `git fetch && git checkout BRANCH && git pull --ff-only`.
+        For non-git hosts (rsync-only): runs rsync of the worker/ tree
+        from the local checkout.
+
+    farmctl logs <worker_name> [-n N]
+        Tail the worker log on a single host (default 50 lines).
+
+    farmctl exec <worker_name> "<cmd>"
+        Run an ad-hoc shell command on a single host. Useful for
+        one-off debugging (e.g. checking disk space).
+
+Exit codes: 0 success; 1 user error; 2 partial failure (one or more
+workers failed); 3 internal/I/O failure.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Optional
+
+ROOT = Path(__file__).resolve().parent.parent
+MANIFEST = ROOT / "ops" / "workers.json"
+SERVER_URL = os.environ.get("EXONIT_SERVER_URL", "http://localhost:8400")
+SERVER_TOKEN = os.environ.get("EXONIT_TOKEN", "exonit-default-token")
+
+
+def load_manifest() -> dict:
+    if not MANIFEST.exists():
+        sys.exit(f"manifest not found: {MANIFEST}")
+    with open(MANIFEST) as f:
+        return json.load(f)
+
+
+def select_workers(manifest: dict, names, want_all: bool) -> list[dict]:
+    workers = manifest["workers"]
+    if want_all:
+        return workers
+    if not names:
+        sys.exit("specify worker names or use --all")
+    by_name = {w["name"]: w for w in workers}
+    out = []
+    for n in names:
+        if n not in by_name:
+            sys.exit(f"unknown worker: {n} (known: "
+                     f"{', '.join(by_name)})")
+        out.append(by_name[n])
+    return out
+
+
+def ssh_exec(worker: dict, command: str, timeout: int = 30) -> tuple[int, str, str]:
+    """Run `command` on the worker (via SSH if remote, locally otherwise).
+
+    The command is passed to the remote shell as-is; quoting is the caller's
+    responsibility. Returns (exit_code, stdout, stderr) - both decoded as
+    UTF-8 with errors='replace' so cp1252-encoded Windows error messages
+    (Spanish locale on <host>/HP) never crash the farmctl run.
+    """
+    if worker["ssh_host"] is None:
+        argv = ["bash", "-c", command]
+    else:
+        argv = ["ssh", "-n", "-o", "ConnectTimeout=10",
+                "-o", "BatchMode=yes", worker["ssh_host"], command]
+    proc = subprocess.run(argv, capture_output=True, timeout=timeout)
+    out = proc.stdout.decode("utf-8", errors="replace") if proc.stdout else ""
+    err = proc.stderr.decode("utf-8", errors="replace") if proc.stderr else ""
+    return proc.returncode, out, err
+
+
+def _instance_override(w: dict, index: int) -> dict:
+    """Return the per-instance override block for ``index`` (``{}`` if none).
+
+    Keys of the manifest's ``instance_overrides`` are the 1-based instance
+    INDEX as a JSON string (``"1"``, ``"2"``, ...) — NOT the instance name
+    (``<name>-1``). Two reasons to key on index rather than name:
+
+    1. Bare-name single-instance hosts. A resolved total of 1 yields the
+       instance under ``w["name"]`` with no numeric suffix at all (see
+       ``_iter_instances``) — keying by name would need a special "no
+       suffix" key just for that case. Keying by index instead means
+       "instance 1" is always ``"1"``, suffixed or not.
+    2. Phase sizing. ``_iter_instances(w, phase=...)`` can resolve a
+       DIFFERENT total for 'scan' vs 'fpp' (``instances`` vs
+       ``instances_fpp``). An override keyed to index 4 means "instance #4
+       of however many this phase starts" — if the fpp phase only starts 2
+       instances, index 4 has no instance to apply to THIS phase. That is
+       not an error (the same manifest entry may be valid for 'scan', which
+       starts more instances) — it is an orphaned override for this
+       particular call, and ``_iter_instances`` warns about it every time it
+       resolves a phase where the key doesn't fit (see
+       ``_warn_orphan_instance_overrides``), rather than silently doing
+       nothing.
+    """
+    overrides = w.get("instance_overrides") or {}
+    return overrides.get(str(index)) or {}
+
+
+def _warn_orphan_instance_overrides(w: dict, total: int) -> None:
+    """Print a loud warning for any ``instance_overrides`` key that does not
+    address an instance actually started by THIS phase resolution.
+
+    Not a hard failure: ``_iter_instances`` is called for both 'scan' and
+    'fpp' within a single ``farmctl start``/``stop`` pass (via
+    ``_iter_instances_all_phases``), and a key that is orphaned for one
+    phase can be perfectly valid for the other (e.g. a host whose
+    ``instances_fpp`` is smaller than ``instances``). Failing the whole
+    command over an index that just isn't in play for the phase being
+    resolved would be wrong. But a typo'd index that never matches ANY
+    phase must not go quietly — this prints on every resolution, so it
+    shows up on every start/stop/status/logs pass over the manifest until
+    fixed.
+    """
+    overrides = w.get("instance_overrides") or {}
+    name = w.get("name", "?")
+    for key in overrides:
+        try:
+            idx = int(key)
+        except (TypeError, ValueError):
+            print(f"WARNING: {name} instance_overrides key {key!r} is not "
+                  f"an integer instance index — ignored.", file=sys.stderr)
+            continue
+        if idx < 1 or idx > total:
+            print(f"WARNING: {name} instance_overrides key {key!r} matches "
+                  f"no instance in this phase resolution (only {total} "
+                  f"instance(s)) — override ignored here. Check for a typo "
+                  f"or a stale index left over from a different phase's "
+                  f"sizing.", file=sys.stderr)
+
+
+def _index_from_instance_name(w: dict, iname: str) -> int:
+    """Recover the 1-based instance index from a name ``_iter_instances``
+    produced, for call sites that only kept the name (e.g. cmd_start's
+    prune step via ``_instances_out_of_phase``, whose str-list return type
+    is an existing tested contract — see tests/test_farmctl_phase_prune.py
+    — and is not changed by this feature). Bare ``w["name"]`` -> index 1
+    (mirrors ``_iter_instances``' own bare-name-is-index-1 rule);
+    ``<name>-N`` -> N.
+    """
+    if iname == w.get("name"):
+        return 1
+    suffix = iname.rsplit("-", 1)[-1]
+    try:
+        return int(suffix)
+    except ValueError:
+        return 1
+
+
+def _merged_env(w: dict, index: int = 1) -> dict:
+    """Host-level ``env`` as the base, the per-instance ``env`` override (if
+    any, for ``index``) merged on top key-by-key.
+
+    Explicit merge semantics (not a wholesale replacement): a host env of
+    ``{"A": "1", "B": "2"}`` with an instance override of ``{"A": "3"}``
+    yields ``{"A": "3", "B": "2"}`` — B survives. No ``instance_overrides``
+    block at all (or none for this index) returns exactly ``w.get("env")``
+    contents, so a manifest entry with no per-instance section is
+    byte-identical to pre-feature behaviour.
+    """
+    merged = dict(w.get("env") or {})
+    merged.update(_instance_override(w, index).get("env") or {})
+    return merged
+
+
+def _merged_config(w: dict, index: int = 1) -> dict:
+    """Host-level ``config`` as the base, per-instance ``config`` override
+    merged on top key-by-key. Same semantics as ``_merged_env`` — see its
+    docstring.
+    """
+    merged = dict(w.get("config") or {})
+    merged.update(_instance_override(w, index).get("config") or {})
+    return merged
+
+
+def _env_prefix(worker: dict, instance_index: int = 1) -> str:
+    """Build a per-platform env-var prefix for the agent.py invocation.
+
+    The manifest may declare an ``env`` dict per worker, and optionally an
+    ``instance_overrides`` block that overrides individual keys for one
+    specific instance (see ``_merged_env``). We prepend the merged result to
+    the shell command so worker.py (spawned by agent.py via
+    subprocess.Popen with inherited os.environ) sees those variables.
+    cmd.exe uses ``set K=V && `` while POSIX shells take inline ``K=V``
+    assignments before the command. For stop/status the prefix is harmless
+    (variables go unused). ``instance_index`` defaults to 1, which is also
+    what a bare (non-suffixed) single-instance host resolves to — so every
+    call site that predates per-instance overrides, or that doesn't (yet)
+    know its loop index, is unaffected.
+    """
+    env = _merged_env(worker, instance_index)
+    if not env:
+        return ""
+    if worker["platform"] == "windows":
+        # Spanish-locale <host>/HP shells: cmd.exe is the default OpenSSH shell.
+        # Quoting `set K=V` further (e.g. wrapping V in quotes) inserts the
+        # quotes into the value itself, so leave the value bare.
+        return " && ".join(f"set {k}={v}" for k, v in env.items()) + " && "
+    return " ".join(f"{k}={shlex.quote(str(v))}" for k, v in env.items()) + " "
+
+
+def _encode_config_overrides_b64(overrides: dict) -> str:
+    """Base64-encode a per-worker `config` override dict for the agent.py CLI.
+
+    Base64, not raw JSON: this argument crosses SSH into cmd.exe, PowerShell
+    and POSIX shells, each with incompatible quoting rules for embedded
+    double quotes (same reasoning as ``--allow-start`` being a flag rather
+    than an env var — see the comment on that line in cmd_start). Base64 is
+    alphanumeric-plus-`+/=`, so it survives all three verbatim. The matching
+    decoder is ``worker/agent.py``'s ``_decode_config_overrides_b64`` — keep
+    both in sync if the encoding ever changes.
+    """
+    return base64.b64encode(json.dumps(overrides).encode("utf-8")).decode("ascii")
+
+
+def agent_call(worker: dict, *args: str, instance_index: int = 1,
+               timeout: int = 30) -> tuple[int, str, str]:
+    """Build the agent.py invocation for a worker and execute it via SSH.
+
+    ``instance_index`` selects which per-instance env override (see
+    ``_merged_env``) is prepended to the command. Default 1 covers every
+    call site that predates ``instance_overrides`` and every single-instance
+    (bare-name) host, so a manifest with no per-instance section produces
+    the exact same command as before this parameter existed.
+    """
+    if worker["platform"] == "windows":
+        agent_path = worker["worker_dir"] + "\\agent.py"
+        base = f'{worker["python"]} "{agent_path}" ' + " ".join(
+            f'"{a}"' for a in args)
+    else:
+        agent_path = worker["worker_dir"] + "/agent.py"
+        base = (f'{worker["python"]} {shlex.quote(agent_path)} '
+                + " ".join(shlex.quote(a) for a in args))
+    cmd = _env_prefix(worker, instance_index) + base
+    return ssh_exec(worker, cmd, timeout=timeout)
+
+
+def fmt_bool(value) -> str:
+    if value is True:
+        return "yes"
+    if value is False:
+        return "no"
+    return str(value)
+
+
+def cmd_status(args, manifest: dict) -> int:
+    """Combine /api/worker/list (heartbeat) + optional agent.py status."""
+    try:
+        import requests
+    except ImportError:
+        sys.exit("requests not installed; pip install requests")
+
+    try:
+        r = requests.get(f"{SERVER_URL}/api/worker/list",
+                         headers={"Authorization": f"Bearer {SERVER_TOKEN}"},
+                         timeout=5)
+        r.raise_for_status()
+        registry = {w.get("name"): w for w in r.json().get("workers", [])}
+    except Exception as exc:
+        print(f"warning: could not reach server ({exc})", file=sys.stderr)
+        registry = {}
+
+    workers = manifest["workers"]
+    rows = []
+    for w in workers:
+        info = registry.get(w["name"], {})
+        last_hb = info.get("last_heartbeat") or info.get("last_seen")
+        online = bool(info.get("online"))
+        git_sha = info.get("git_sha") or "?"
+        flags = info.get("flag_states") or {}
+        ffi_flag = fmt_bool(flags.get("ffi_fallback_on_load_fail"))
+        status = info.get("status", "?")
+        uptime = info.get("uptime_s")
+        uptime_str = (
+            f"{int(uptime // 3600)}h{int((uptime % 3600) // 60)}m"
+            if isinstance(uptime, (int, float)) else "?")
+        rows.append({
+            "name": w["name"],
+            "online": "online" if online else "OFFLINE",
+            "status": status,
+            "git_sha": git_sha,
+            "ffi_fallback": ffi_flag,
+            "uptime": uptime_str,
+            "last_heartbeat": last_hb or "-",
+        })
+
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+
+    width = max(len(r["name"]) for r in rows) + 2
+    header = f"{'WORKER':<{width}}  {'STATE':<8}  {'PHASE':<10}  {'GIT':<10}  {'FFI':<5}  {'UPTIME':<8}  HEARTBEAT"
+    print(header)
+    print("-" * len(header))
+    for r in rows:
+        print(f"{r['name']:<{width}}  {r['online']:<8}  {r['status']:<10}  "
+              f"{r['git_sha']:<10}  {r['ffi_fallback']:<5}  "
+              f"{r['uptime']:<8}  {r['last_heartbeat']}")
+
+    if args.detail:
+        print()
+        for w in workers:
+            instances = w.get("instances", 1) or 1
+            if instances > 1:
+                for i in range(1, instances + 1):
+                    iname = f"{w['name']}-{i}"
+                    rc, out, err = agent_call(w, "status", iname, instance_index=i)
+                    if rc != 0:
+                        print(f"{iname}: agent error rc={rc} {err.strip() or out.strip()}")
+                    else:
+                        print(f"{iname}: {out.strip()}")
+            else:
+                rc, out, err = agent_call(w, "status", w["name"])
+                if rc != 0:
+                    print(f"{w['name']}: agent error rc={rc} {err.strip() or out.strip()}")
+                else:
+                    print(f"{w['name']}: {out.strip()}")
+    return 0
+
+
+def _iter_instances(w: dict, phase: str = "scan"):
+    """Yield (instance_name, instance_index, total_instances) for a worker entry,
+    sized for the given ``phase`` ('scan' or 'fpp').
+
+    ``phase="scan"`` (default, retrocompat): total = ``w["instances"]``
+    (default 1) — unchanged from before the fleet-autoscale-by-phase feature.
+    ``phase="fpp"``: total = ``w["instances_fpp"]`` if present, else falls
+    back to ``w["instances"]`` (a host that doesn't declare a separate FPP
+    sizing keeps its scan-phase count — "host that doesn't scale", per
+    docs/superpowers/specs/fleet-autoscale-by-phase.md).
+
+    Disabled means "the RESOLVED total for this phase is 0" (2026-08-05):
+    ``instances: 0`` disables the scan phase, and also disables fpp when
+    ``instances_fpp`` is absent (the fallback). But ``instances: 0`` +
+    ``instances_fpp: N`` is a valid FPP-only host — this is exactly the
+    shape of the M4 python entries since the Swift scan takeover (scan by
+    the -swift entry, FPP by the python entry). The old rule ("instances: 0
+    disables EVERY phase, instances_fpp ignored") silently removed 45 M4 +
+    17 <host> FPP workers from the fleet.
+
+    For a resolved total of 1 (or absent) yields a single tuple with
+    ``(w['name'], 1, 1)`` — identical to the legacy single-worker path.
+    For a resolved total >1 yields one tuple per instance with names
+    ``<name>-1``, ``<name>-2``, …, ``<name>-N``.
+
+    ``sidecar_fpp: true`` (2026-08-07, python-fpp-sidecar -- see
+    ``exonit-rust-worker``'s ``docs/RUNBOOK_PYTHON_FPP_SIDECAR.md``) changes
+    the ``phase="fpp"`` resolution ONLY: instead of splitting
+    ``instances_fpp`` into ``<name>-1``..``<name>-N`` the way a native
+    multi-instance host does, it yields a SINGLE tuple for the bare
+    ``w["name"]`` (``total=1``, not the real ``instances_fpp`` -- that value
+    is read back out directly in ``_start_sidecar_fpp``, which builds the
+    single ``agent start <name> --fpp-instances N`` call the Rust agent
+    understands). The point is for the bare name to correctly show up as
+    "wanted this phase" in ``_instances_out_of_phase``/
+    ``_iter_instances_all_phases`` without farmctl ever producing a
+    ``<name>-i`` split for it -- the Rust agent, not farmctl, manages the N
+    Python sidecar processes internally. A host with no ``sidecar_fpp`` key
+    (every entry before this feature, and every entry after it that doesn't
+    opt in) is completely unaffected -- this branch is only reached when the
+    key is truthy. ``instances_fpp: 0`` still means "sits FPP out entirely"
+    regardless of ``sidecar_fpp`` (checked below, same as any other host).
+
+    Every resolution also checks the worker's optional ``instance_overrides``
+    block (per-instance ``env``/``config`` overrides — see
+    ``_merged_env``/``_merged_config``) against the total just computed and
+    warns (stderr, non-fatal) about any key that addresses no instance in
+    THIS phase — see ``_warn_orphan_instance_overrides``. A key can be valid
+    for 'scan' and orphaned for 'fpp' (or vice versa) on a host whose
+    ``instances_fpp`` differs from ``instances``; that is not a bug, so it is
+    a warning, not a refusal.
+    """
+    base = w.get("instances", 1)
+    if base is None:
+        base = 1
+    if phase == "fpp":
+        total = w.get("instances_fpp")
+        if total is None:
+            total = base
+    else:
+        total = base
+    if total is None:
+        total = 1
+    _warn_orphan_instance_overrides(w, total)
+    if total == 0:
+        return
+    if phase == "fpp" and w.get("sidecar_fpp"):
+        yield w["name"], 1, 1
+        return
+    if total <= 1:
+        yield w["name"], 1, 1
+    else:
+        for i in range(1, total + 1):
+            yield f"{w['name']}-{i}", i, total
+
+
+def _iter_instances_all_phases(w: dict):
+    """Union of instance names across every known phase (scan ∪ fpp), deduped.
+
+    Used by ``farmctl stop`` (fleet-autoscale-by-phase spec, footgun 1): a
+    worker scaled up for FPP_BACKFILL must have EVERY name it could have
+    started stopped, even if the manifest sizing later changes or the run
+    never reaches FPP_BACKFILL — stopping a name that never started is a
+    tolerant no-op at the agent.py level (returns {"status": "not_running"},
+    rc=0), so over-covering names here is always safe.
+
+    A worker with ``instances: 1`` and ``instances_fpp: 3`` starts as a bare
+    name in scan and as ``-1``/``-2``/``-3`` in fpp — this yields all four.
+    """
+    seen: dict = {}
+    for phase in ("scan", "fpp"):
+        for iname, idx, total in _iter_instances(w, phase=phase):
+            seen.setdefault(iname, (iname, idx, total))
+    return list(seen.values())
+
+
+#: Guard against ACCIDENTAL fleet starts (2026-07-14 incident).
+#: `farmctl start` SSHes into 10 real hosts and launches up to 83 worker
+#: processes that write to the production DB. On 2026-07-13/14 the fleet was
+#: started three times by automated agents that had been told, in writing, not
+#: to touch it — one of them silently re-marked 10k candidates mid-analysis.
+#: Instructions are not a control; this is. Anything that legitimately starts
+#: the fleet (the discovery orchestrator's _scale_fleet, the server's
+#: /api/workers/start behind the UI button, a human at a terminal) sets this
+#: env var explicitly. A test, a subagent, or a stray script does not — so it
+#: gets a loud refusal instead of 83 workers.
+#: `stop` is deliberately NOT guarded by THIS env var outside of pytest: the
+#: emergency brake must always work for a human/orchestrator. See
+#: PYTEST_GUARD_ENV below for the separate, pytest-only guard that DOES cover
+#: `stop` (and every other mutating subcommand) — a very different threat
+#: model (an unmocked test hitting real hardware, not an operator's brake).
+START_GUARD_ENV = "EXONIT_FARMCTL_ALLOW_START"
+
+
+def _start_allowed() -> bool:
+    return os.environ.get(START_GUARD_ENV) == "1"
+
+
+def _refuse_start() -> int:
+    print(f"REFUSED: `farmctl start` needs {START_GUARD_ENV}=1 in the "
+          f"environment.\n"
+          f"  This guard exists because automated agents started the real "
+          f"fleet three times on 2026-07-13/14 while explicitly instructed "
+          f"not to.\n"
+          f"  Legitimate callers (discovery orchestrator, server UI button) "
+          f"set it themselves. If you are a human and you mean it:\n"
+          f"    {START_GUARD_ENV}=1 farmctl start --all [--phase scan|fpp]\n"
+          f"  `farmctl stop` is never guarded by this particular env var.",
+          file=sys.stderr)
+    return 2
+
+
+#: Hard guard (2026-09-26 incident): a pytest run reached
+#: scripts/lora_macs_driver.py for real, which called `farmctl stop` on all
+#: 5 production M4 Swift workers mid discovery-run. pytest sets
+#: PYTEST_CURRENT_TEST in os.environ for the duration of every test (and
+#: subprocesses inherit it), so this is a reliable signal we are running
+#: under pytest however farmctl was invoked. Covers every subcommand that
+#: SSHes to a real host and/or changes remote or local state — including
+#: `stop`, deliberately, unlike START_GUARD_ENV above: under pytest there is
+#: no legitimate "emergency brake" call that needs to reach real hardware
+#: unconditionally; a test that genuinely wants to exercise the real CLI
+#: end-to-end sets this explicitly and mocks the actual remote actions
+#: (agent_call/subprocess) itself.
+#:
+#: Audited every subcommand in `main()`'s subparsers (2026-09-26 review
+#: follow-up) so this set is exhaustive by inspection, not by omission:
+#:   start/stop/restart/deploy -> in MUTATING_COMMANDS (SSH + remote/local
+#:     mutation: agent.py start/stop, or git pull/rsync onto the host).
+#:   exec -> in MUTATING_COMMANDS: `cmd_exec` runs an ARBITRARY,
+#:     caller-supplied shell command line on a real host over SSH
+#:     (`ssh_exec(w, args.cmd, ...)`) — the single most dangerous
+#:     subcommand in this file, more so than `stop`.
+#:   logs -> deliberately NOT in MUTATING_COMMANDS: `cmd_logs` does perform a
+#:     real SSH call (`agent_call(w, "logs", ...)`), but it only reads a
+#:     remote log file and mutates nothing — same read-only classification
+#:     as `status`, called out explicitly here (rather than left silently
+#:     absent) so this comment stays true if another subcommand is ever
+#:     added.
+#:   status -> never guarded (read-only, `requests.get` to the server, no
+#:     SSH at all).
+PYTEST_GUARD_ENV = "EXONIT_FARMCTL_ALLOW_UNDER_PYTEST"
+MUTATING_COMMANDS = {"start", "stop", "restart", "deploy", "exec"}
+
+
+def _pytest_guard_ok(command: str) -> bool:
+    if command not in MUTATING_COMMANDS:
+        return True
+    if "PYTEST_CURRENT_TEST" not in os.environ:
+        return True
+    return os.environ.get(PYTEST_GUARD_ENV) == "1"
+
+
+def _refuse_under_pytest(command: str) -> int:
+    print(f"REFUSED: `farmctl {command}` detected PYTEST_CURRENT_TEST in the "
+          f"environment (this process is running under pytest) — real "
+          f"SSH/mutating fleet actions are blocked under pytest unless "
+          f"{PYTEST_GUARD_ENV}=1 is set explicitly.\n"
+          f"  This guard exists because a test caused a real `farmctl stop` "
+          f"against the 5 production M4 Swift workers mid discovery-run on "
+          f"2026-09-26 (via an unmocked scripts/lora_macs_driver.py).\n"
+          f"  Unit tests must mock agent_call/subprocess instead of "
+          f"exercising the real network path.",
+          file=sys.stderr)
+    return 2
+
+
+def _instances_out_of_phase(w: dict, phase: str):
+    """Instance names this worker runs in SOME phase but not in *phase*.
+
+    ``farmctl start --phase X`` means "size the fleet for phase X", and sizing
+    down is half of sizing (2026-07-14). Before this, start was purely additive:
+    a host declaring ``instances: 2`` / ``instances_fpp: 0`` (the slow hosts —
+    the M1 mac mini, the HP laptop, a laptop worker: they must scan but must NOT
+    take FPP work) kept both scan instances running straight through
+    FPP_BACKFILL, because nothing ever told them to stop. Those are exactly the
+    hosts whose FPP items become the tail everyone else waits on.
+
+    Down-sizing a host to 0 for a phase is therefore expressible as
+    ``instances_fpp: 0`` and actually enforced here. ``instances: 0`` still
+    means disabled everywhere (_iter_instances yields nothing in any phase, so
+    the name never appears in either set and is never touched).
+    """
+    keep = {iname for iname, _i, _t in _iter_instances(w, phase=phase)}
+    return [iname for iname, _i, _t in _iter_instances_all_phases(w)
+            if iname not in keep]
+
+
+def _expected_online_names(w: dict, phase: str = "scan") -> set:
+    """Worker names this entry is expected to REGISTER on the server for
+    `phase`.
+
+    Identical to the names `_iter_instances` yields except for one case: a
+    ``sidecar_fpp`` host in the ``fpp`` phase. There `_iter_instances`
+    deliberately yields the bare entry name (that is the unit farmctl
+    starts/stops — ONE `agent start <name> --fpp-instances N` call), but the
+    processes that actually heartbeat into ``/api/worker/list`` are the N
+    Python sidecars the Rust agent spawns, named ``<name>-py-1..N`` (see
+    exonit-rust-worker's docs/RUNBOOK_PYTHON_FPP_SIDECAR.md). Callers that
+    verify the fleet against the server registry (the discovery
+    orchestrator's fleet-verify) must use THIS resolution, not
+    `_iter_instances`, or every sidecar host would look permanently missing.
+    """
+    if phase == "fpp" and w.get("sidecar_fpp"):
+        count = w.get("instances_fpp")
+        if count is None:
+            count = w.get("instances", 1) or 1
+        if not count:
+            return set()
+        return {f"{w['name']}-py-{i}" for i in range(1, int(count) + 1)}
+    return {iname for iname, _idx, _total in _iter_instances(w, phase=phase)}
+
+
+def _start_sidecar_fpp(w: dict, server_url: str) -> bool:
+    """Starts a ``sidecar_fpp`` host's FPP-phase Python workers with ONE
+    ``agent start <name> --fpp-instances N --allow-start`` call to the Rust
+    agent, instead of farmctl's own per-instance ``<name>-i`` loop
+    (``cmd_start``'s normal body, still used for every non-sidecar host and
+    for this same host's 'scan' phase). See ``_iter_instances``'
+    ``sidecar_fpp`` doc and ``exonit-rust-worker``'s
+    ``docs/RUNBOOK_PYTHON_FPP_SIDECAR.md`` for the full design: the Rust
+    agent reads an optional ``python_sidecar`` section from ITS OWN
+    ``config.json`` and shells out to the Python fleet's ``worker/agent.py``
+    N times itself, spawning all N before waiting on any of them — so the
+    45 s timeout below is headroom for SSH + process overhead, not N Python
+    startups in series.
+
+    N is ``instances_fpp`` (falling back to ``instances``, the same default
+    ``_iter_instances`` uses elsewhere) — reused as-is; only HOW it reaches
+    the agent changes for a sidecar host. Returns ``False`` (and prints a
+    ``FAILED`` line, matching the per-instance loop's own convention) on a
+    non-zero ``agent.py`` exit code, so ``cmd_start`` can count it toward
+    its ``failed`` total exactly like any other instance failure.
+    """
+    name = w["name"]
+    count = w.get("instances_fpp")
+    if count is None:
+        count = w.get("instances", 1) or 1
+    if not count:
+        print(f"[{name}] sidecar_fpp: instances_fpp=0, nothing to start "
+              f"(host sits FPP out)")
+        return True
+    agent_args = ["start", name, "--fpp-instances", str(count)]
+    if w["ssh_host"] is not None:
+        agent_args += ["--server-url", server_url]
+    # Same per-host `config` override plumbing every other start uses (see
+    # cmd_start's own comment on this) — forwarded verbatim to the Rust
+    # agent, which forwards it verbatim again to each Python `agent.py
+    # start` sidecar call. Deliberately `_merged_config(w, 1)`: sidecar
+    # hosts have no per-instance `instance_overrides` split (there is only
+    # ever ONE `agent start` call here), so index 1 is always the right
+    # (and only) resolution.
+    config_overrides = _merged_config(w, 1)
+    if isinstance(config_overrides, dict) and config_overrides:
+        agent_args += ["--config-overrides-b64",
+                       _encode_config_overrides_b64(config_overrides)]
+    agent_args.append("--allow-start")
+    rc, out, err = agent_call(w, *agent_args, instance_index=1, timeout=45)
+    prefix = f"[{name}] "
+    if rc != 0:
+        print(prefix + f"FAILED rc={rc} {err.strip() or out.strip()}")
+        return False
+    print(prefix + out.strip())
+    return True
+
+
+def cmd_start(args, manifest: dict) -> int:
+    if not _start_allowed():
+        return _refuse_start()
+    workers = select_workers(manifest, args.workers, args.all)
+    server_url = manifest.get("server_url") or os.environ.get(
+        "EXONIT_FARMCTL_SERVER_URL", "http://127.0.0.1:8400")
+    # --phase selects the sizing (instances vs instances_fpp) — see
+    # _iter_instances. getattr default covers `restart`-via-`start` callers
+    # that share an args namespace which may predate this flag.
+    phase = getattr(args, "phase", "scan") or "scan"
+    prune = not getattr(args, "no_prune", False)
+    failed = 0
+    for w in workers:
+        # Size DOWN first, then up: on a host that is losing instances this
+        # frees its CPU/GPU before the survivors take on the new phase's work,
+        # and on a host that is only gaining them it is a no-op (stopping a
+        # name that never started returns "not_running", rc=0, at agent.py).
+        if prune:
+            for iname in _instances_out_of_phase(w, phase):
+                rc, out, err = agent_call(
+                    w, "stop", iname,
+                    instance_index=_index_from_instance_name(w, iname),
+                    timeout=30)
+                if rc != 0:
+                    print(f"[{iname}] PRUNE FAILED rc={rc} "
+                          f"{err.strip() or out.strip()}")
+                    failed += 1
+                else:
+                    print(f"[{iname}] pruned (not in phase {phase}): "
+                          f"{out.strip()}")
+        for iname, idx, total in _iter_instances(w, phase=phase):
+            if phase == "fpp" and w.get("sidecar_fpp"):
+                # See _iter_instances' `sidecar_fpp` doc: this tuple is
+                # always the bare name with total=1 (not the real
+                # instances_fpp) for a sidecar host in the fpp phase — the
+                # real count is read back out inside _start_sidecar_fpp,
+                # which issues ONE `--fpp-instances N` call instead of
+                # farmctl's own per-instance loop below.
+                if not _start_sidecar_fpp(w, server_url):
+                    failed += 1
+                continue
+            # Local worker keeps its config.json server_url (localhost is
+            # correct); remote workers use the manifest-level server_url so
+            # config.json can remain identical across hosts.
+            if w["ssh_host"] is None:
+                agent_args = ["start", iname]
+            else:
+                agent_args = ["start", iname, "--server-url", server_url]
+            if total > 1:
+                agent_args += ["--instances", str(total),
+                               "--instance-index", str(idx)]
+            # Per-host config overrides (config-overrides-per-host feature),
+            # with per-instance keys on top (per-instance-overrides feature):
+            # applied to EVERY instance, single or multi, and to `restart`
+            # too (it shares this arg-building code via cmd_start). See
+            # ops/workers.json's `config`/`instance_overrides` field docs and
+            # worker/agent.py's _decode_config_overrides_b64.
+            config_overrides = _merged_config(w, idx)
+            if isinstance(config_overrides, dict) and config_overrides:
+                agent_args += ["--config-overrides-b64",
+                               _encode_config_overrides_b64(config_overrides)]
+            # Propagate the authorisation we just checked (_start_allowed
+            # above) down to agent.py's own guard. As a FLAG, not an env var:
+            # `ssh host 'VAR=1 python3 agent.py ...'` is shell-dependent and
+            # silently drops the variable on some hosts (PowerShell), which
+            # would turn every remote start into a refusal.
+            agent_args.append("--allow-start")
+            rc, out, err = agent_call(w, *agent_args, instance_index=idx,
+                                      timeout=30)
+            prefix = f"[{iname}] "
+            if rc != 0:
+                print(prefix + f"FAILED rc={rc} {err.strip() or out.strip()}")
+                failed += 1
+            else:
+                print(prefix + out.strip())
+    return 2 if failed else 0
+
+
+def cmd_stop(args, manifest: dict) -> int:
+    """Stop every instance name any phase could have started.
+
+    Deliberately NOT phase-parameterized (fleet-autoscale-by-phase spec,
+    footgun 1): a scale-up during FPP_BACKFILL must always be fully torn
+    down, even if the manifest sizing is edited in between — see
+    _iter_instances_all_phases.
+    """
+    workers = select_workers(manifest, args.workers, args.all)
+    failed = 0
+    for w in workers:
+        for iname, idx, _total in _iter_instances_all_phases(w):
+            agent_args = ["stop", iname] + (["--force"] if args.force else [])
+            rc, out, err = agent_call(w, *agent_args, instance_index=idx,
+                                      timeout=30)
+            prefix = f"[{iname}] "
+            if rc != 0:
+                print(prefix + f"FAILED rc={rc} {err.strip() or out.strip()}")
+                failed += 1
+            else:
+                print(prefix + out.strip())
+    return 2 if failed else 0
+
+
+def cmd_restart(args, manifest: dict) -> int:
+    rc_stop = cmd_stop(args, manifest)
+    time.sleep(2)
+    rc_start = cmd_start(args, manifest)
+    return max(rc_stop, rc_start)
+
+
+def cmd_deploy(args, manifest: dict) -> int:
+    workers = select_workers(manifest, args.workers, args.all)
+    failed = 0
+    for w in workers:
+        # Robust git deploy: stash tracked mods (NOT untracked - the
+        # <host> repo has many GB of data/ artefacts that would make
+        # `stash -u` time out), then `checkout -f` to overwrite tracked
+        # mods that prevent a clean switch. Stash is left on the stack
+        # as a forensic record.
+        prefix = f"[{w['name']}] "
+        if w["platform"] == "windows":
+            null_redir = "ver>nul"
+            git_cmd = (
+                f'cd /d "{w["worker_dir"]}" && '
+                f'(git stash -m "farmctl-pre-deploy" || {null_redir}) && '
+                f'git fetch origin {args.branch} && '
+                f'git checkout -f {args.branch} && '
+                f'git pull --ff-only')
+        else:
+            qd = shlex.quote(w["worker_dir"])
+            git_cmd = (
+                f'git -C {qd} stash -m "farmctl-pre-deploy" || true; '
+                f'git -C {qd} fetch origin {args.branch} && '
+                f'git -C {qd} checkout -f {args.branch} && '
+                f'git -C {qd} pull --ff-only')
+        rc, out, err = ssh_exec(w, git_cmd, timeout=180)
+        if rc == 0:
+            print(prefix + f"git pull OK ({args.branch})")
+            continue
+        # Fallback: rsync the worker/ tree from local checkout.
+        if w["ssh_host"] is None:
+            print(prefix + "ERROR: local worker not git-tracked? "
+                  "Cannot deploy.")
+            failed += 1
+            continue
+        # The non-git remotes typically have a parent dir layout where the
+        # worker tree is the root of the deploy. Use the local repo's
+        # worker/ directory as source.
+        local_src = str(ROOT / "worker") + "/"
+        remote_dst = f'{w["ssh_host"]}:{w["worker_dir"]}/'
+        rsync_cmd = ["rsync", "-az",
+                     "--exclude=__pycache__", "--exclude=*.log*",
+                     "--exclude=*.pid", "--exclude=.agent.*",
+                     "--exclude=venv", "--exclude=.venv",
+                     local_src, remote_dst]
+        rs = subprocess.run(rsync_cmd, capture_output=True, text=True,
+                            timeout=300)
+        if rs.returncode == 0:
+            print(prefix + "rsync OK (non-git host)")
+        else:
+            print(prefix + f"FAILED git rc={rc} rsync rc={rs.returncode}\n"
+                  f"  git stderr: {err.strip()[:200]}\n"
+                  f"  rsync stderr: {rs.stderr.strip()[:200]}")
+            failed += 1
+    return 2 if failed else 0
+
+
+def cmd_logs(args, manifest: dict) -> int:
+    workers = select_workers(manifest, [args.worker], False)
+    w = workers[0]
+    instances = w.get("instances", 1) or 1
+    if instances <= 1:
+        # Single-worker host: pass the worker name directly so agent reads
+        # worker-<name>.log (or falls back to legacy worker.log).
+        rc, out, err = agent_call(w, "logs", w["name"], "-n", str(args.n),
+                                  timeout=15)
+        if rc != 0:
+            print(err or out, file=sys.stderr)
+            return 2
+        print(out, end="")
+    else:
+        # Multi-worker host: iterate instances and label each block.
+        failed = 0
+        for iname, idx, _total in _iter_instances(w):
+            rc, out, err = agent_call(w, "logs", iname, "-n", str(args.n),
+                                      instance_index=idx, timeout=15)
+            print(f"=== {iname} ===")
+            if rc != 0:
+                print(err or out, file=sys.stderr)
+                failed += 1
+            else:
+                print(out, end="")
+        if failed:
+            return 2
+    return 0
+
+
+def cmd_exec(args, manifest: dict) -> int:
+    workers = select_workers(manifest, [args.worker], False)
+    w = workers[0]
+    rc, out, err = ssh_exec(w, args.cmd, timeout=120)
+    if out:
+        print(out, end="")
+    if err:
+        print(err, end="", file=sys.stderr)
+    return rc
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(prog="farmctl",
+                                description=__doc__.split("\n")[0])
+    sub = p.add_subparsers(dest="command", required=True)
+
+    p_status = sub.add_parser("status",
+                              help="Show worker farm health (uses heartbeat)")
+    p_status.add_argument("--detail", action="store_true",
+                          help="Also call agent.py status (per-host SSH; slower)")
+    p_status.add_argument("--json", action="store_true",
+                          help="Output rows as JSON instead of a table")
+    p_status.set_defaults(func=cmd_status)
+
+    p_start = sub.add_parser("start", help="Start one or more workers")
+    p_start.add_argument("workers", nargs="*")
+    p_start.add_argument("--all", action="store_true")
+    p_start.add_argument("--phase", choices=["scan", "fpp"], default="scan",
+                         help="Fleet sizing phase: 'scan' uses `instances` "
+                              "(default), 'fpp' uses `instances_fpp` (falls "
+                              "back to `instances` when absent). Idempotent: "
+                              "only starts instances that aren't already "
+                              "running, and STOPS the ones this phase does not "
+                              "size for (see --no-prune). See "
+                              "docs/superpowers/specs/fleet-autoscale-by-phase.md.")
+    p_start.add_argument("--no-prune", action="store_true",
+                         help="Do NOT stop instances that are running but not "
+                              "sized for this phase (e.g. a host with "
+                              "`instances_fpp: 0` keeps its scan instances "
+                              "alive through FPP_BACKFILL). Additive-only: the "
+                              "pre-2026-07-14 behaviour.")
+    p_start.set_defaults(func=cmd_start)
+
+    p_stop = sub.add_parser("stop", help="Stop one or more workers")
+    p_stop.add_argument("workers", nargs="*")
+    p_stop.add_argument("--all", action="store_true")
+    p_stop.add_argument("--force", action="store_true",
+                        help="Send SIGKILL immediately")
+    p_stop.set_defaults(func=cmd_stop)
+
+    p_restart = sub.add_parser("restart", help="Stop + start one or more workers")
+    p_restart.add_argument("workers", nargs="*")
+    p_restart.add_argument("--all", action="store_true")
+    p_restart.add_argument("--force", action="store_true")
+    p_restart.add_argument("--phase", choices=["scan", "fpp"], default="scan",
+                           help="Sizing phase for the start half of the "
+                                "restart (stop always covers every phase).")
+    p_restart.set_defaults(func=cmd_restart)
+
+    p_deploy = sub.add_parser("deploy",
+                              help="Pull latest code on workers (git pull or rsync)")
+    p_deploy.add_argument("workers", nargs="*")
+    p_deploy.add_argument("--all", action="store_true")
+    p_deploy.add_argument("--branch", default="main",
+                          help="Git branch to deploy (default: main)")
+    p_deploy.set_defaults(func=cmd_deploy)
+
+    p_logs = sub.add_parser("logs", help="Tail worker log on a single host")
+    p_logs.add_argument("worker")
+    p_logs.add_argument("-n", type=int, default=50,
+                        help="Trailing lines (default 50; 0 = all)")
+    p_logs.set_defaults(func=cmd_logs)
+
+    p_exec = sub.add_parser("exec",
+                            help="Run an ad-hoc shell command on a single host")
+    p_exec.add_argument("worker")
+    p_exec.add_argument("cmd", help="Command line to run remotely")
+    p_exec.set_defaults(func=cmd_exec)
+
+    args = p.parse_args(argv)
+    if not _pytest_guard_ok(args.command):
+        return _refuse_under_pytest(args.command)
+    manifest = load_manifest()
+    return args.func(args, manifest)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

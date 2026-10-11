@@ -1,0 +1,736 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ExoNit — Status</title>
+<link rel="stylesheet" href="/static/exonit.css">
+</head>
+<body>
+<canvas id="bgScene" aria-hidden="true"></canvas>
+<nav class="console">
+  <a class="brand" href="/">EXONIT</a>
+  <a href="/">Dashboard</a>
+  <a href="/results">Results</a>
+  <a href="/completion">Completion</a>
+  <a href="/downloads">Downloads</a>
+  <a href="/status" aria-current="page">Status</a>
+  <a href="/sky">Sky</a>
+  <span class="console-live"><i class="live-dot" id="consoleLiveDot"></i> <span id="consoleLiveCount">&mdash; workers</span> &middot; <span data-fx-toggle>FX on</span></span>
+</nav>
+
+<main class="page">
+  <header class="page-head">
+    <div class="kicker">Fleet</div>
+    <h1>Status</h1>
+    <p>Every machine in the ExoNit fleet, its current load, and the debug switch for each worker instance.</p>
+  </header>
+
+  <div class="cols">
+
+    <!-- Block 1: answer-first headline -->
+    <div class="card elev-sm stat span-all">
+      <div class="kicker">Fleet</div>
+      <div class="stat-value" id="headlineValue">—</div>
+      <div class="stat-note num" id="headlineNote">Loading fleet status…</div>
+      <div class="stat-grid" id="fleetTotals"></div>
+    </div>
+
+    <!-- Block 2: workers table (absorbs dashboard-workers.html) + telemetry detail.
+         Full row (span-all) — Workers comes before Machines (operator decision
+         2026-07-25). No .toolbar on this page: the workers table IS the
+         control surface — each row carries its own stop + debug toggle, and
+         there is no page-level .btn-primary (see plan Task 6). The "stop
+         computer" bulk action is a scoped .controls row above the table, not
+         a second toolbar — it operates purely on this table's own worker
+         list (name-prefix grouping), same as the old dashboard's. -->
+    <div class="card elev-sm span-all">
+      <div class="card-title">Workers</div>
+      <span class="card-meta" id="workersStale"></span>
+      <div class="controls hidden" id="stopComputerRow">
+        <div class="field">
+          <label for="computerSelect">Computer</label>
+          <select id="computerSelect" class="input"></select>
+        </div>
+        <button id="btnStopComputer" class="btn btn-secondary" type="button"></button>
+        <span class="text-muted" id="stopComputerNote"></span>
+      </div>
+      <div class="table-scroll">
+        <table class="table" id="workersTable">
+          <thead>
+            <tr>
+              <th>Name</th><th>Status</th><th>TIC</th><th>Phase</th><th>Progress</th>
+              <th>Stars</th><th>Avg (s) — fastest first</th><th>Last seen</th><th>Debug</th><th>Stop</th>
+            </tr>
+          </thead>
+          <tbody id="workersBody"></tbody>
+        </table>
+      </div>
+      <div id="workerDetail"></div>
+    </div>
+
+    <!-- Block 3: fleet map + per-machine detail. Full row (span-all), below
+         Workers (operator decision 2026-07-25). -->
+    <div class="card elev-sm span-all">
+      <div class="card-head">
+        <div>
+          <div class="card-title">Machines</div>
+          <span class="card-meta" id="fleetStale"></span>
+        </div>
+        <button id="btnAddWorker" class="btn btn-secondary" type="button"></button>
+      </div>
+      <svg id="fleetSvg" class="fleetmap" viewBox="0 0 800 460" xmlns="http://www.w3.org/2000/svg"></svg>
+      <div class="hr"></div>
+      <div class="table-scroll">
+        <table class="table" id="computersTable">
+          <thead>
+            <tr>
+              <th>Machine</th><th>OS</th><th>Status</th><th>Workers</th><th>GPU</th>
+              <th>CPU</th><th>RAM</th><th>GPU util</th><th>VRAM</th><th>Temp</th>
+              <th>Power</th><th>Tasks</th><th>Last seen</th>
+            </tr>
+          </thead>
+          <tbody id="computersBody"></tbody>
+        </table>
+      </div>
+    </div>
+
+  </div>
+</main>
+
+<div class="dialog-backdrop hidden" id="addWorkerBackdrop">
+  <div class="dialog">
+    <div class="dialog-head">
+      <div class="dialog-title">Add a worker</div>
+      <button class="btn btn-icon btn-secondary" id="addWorkerClose" type="button" aria-label="Close"></button>
+    </div>
+    <div class="dialog-body" id="addWorkerBody"></div>
+  </div>
+</div>
+
+<script type="module">
+import { getJSON, postJSON } from '/js/api.js';
+import { esc, fmtInt, fmtPct, fmtNum, fmtAgo } from '/js/format.js';
+import { poll, staleNote } from '/js/poll.js';
+import { tag, icon, stat } from '/js/ui.js';
+import { initScene, fxEnabled, toggleFx } from '/js/scene.js';
+import { rampColor } from '/js/viz.js';
+
+// ── shell: ambient scene, FX toggle, fixed-console offset ──
+initScene(document.getElementById('bgScene'), { mode: 'ambient' });
+const fxToggleEl = document.querySelector('[data-fx-toggle]');
+fxToggleEl.textContent = `FX ${fxEnabled() ? 'on' : 'off'}`;
+fxToggleEl.addEventListener('click', toggleFx);
+
+// ── small local formatters (fields with a scale/shape format.js doesn't cover) ──
+
+// cpu_percent / gpu_util_pct arrive already on a 0-100 scale (not a 0-1
+// fraction like phase_progress), so fmtPct() would divide by 100 wrongly.
+function fmtPctScale(x) {
+  if (x === null || x === undefined || Number.isNaN(x)) return '—';
+  return `${fmtNum(x, 1)}%`;
+}
+
+function fmtGB(used, total) {
+  if (used === null || used === undefined || total === null || total === undefined) return '—';
+  return `${fmtNum(used, 1)} / ${fmtNum(total, 1)} GB`;
+}
+
+// Occupancy bar for a 0-100 magnitude (CPU/GPU load) — fill color comes from
+// rampColor() (magnitude, not status), the numeric value sits alongside it.
+function occBarPct(pct) {
+  if (pct === null || pct === undefined || Number.isNaN(pct)) return '<span class="text-muted">—</span>';
+  const clamped = Math.max(0, Math.min(100, pct));
+  return `<div style="display:flex; align-items:center; gap: var(--sp-2)">
+    <span class="bar bar-sm" style="flex:1"><i style="width:${clamped}%; background:${rampColor(clamped / 100)}"></i></span>
+    <span class="num">${fmtPctScale(pct)}</span>
+  </div>`;
+}
+
+// Same idea for RAM, which the fleet payload reports as used/total GB rather
+// than a ready-made percentage.
+function occBarGB(used, total) {
+  if (used === null || used === undefined || total === null || total === undefined) return '<span class="text-muted">—</span>';
+  const frac = total > 0 ? Math.max(0, Math.min(1, used / total)) : 0;
+  return `<div style="display:flex; align-items:center; gap: var(--sp-2)">
+    <span class="bar bar-sm" style="flex:1"><i style="width:${(frac * 100).toFixed(1)}%; background:${rampColor(frac)}"></i></span>
+    <span class="num">${fmtGB(used, total)}</span>
+  </div>`;
+}
+
+const OS_LABEL = { linux: 'Linux', macos: 'macOS', windows: 'Windows' };
+
+// gpu_name arrives '—' (server default) when no capability was ever reported,
+// and equal to gpu_backend (e.g. 'numba (numba)') on CPU-only machines where
+// the BLS backend name leaked into the GPU name field — neither is a GPU a
+// human should read as real hardware. Render both cases honestly instead of
+// echoing the backend word twice.
+//
+// The server now resolves the device name from the hardware probe rather than
+// from the BLS backend (see _gpu_identity in exonit/routes/workers.py), so
+// "No GPU reported" here means the machine really has no accelerator — it is
+// no longer reached by the six Macs that run BLS on numba and everything else
+// on Metal.
+const GPU_BACKEND_WORDS = new Set(['numba', 'cpu']);
+
+function renderGpuCell(c) {
+  const backend = c.gpu_backend || null;
+  const rawName = c.gpu_name;
+  const name = (rawName && rawName !== '—') ? String(rawName) : null;
+  const meaningless = !name
+    || (backend && name.toLowerCase() === String(backend).toLowerCase())
+    || GPU_BACKEND_WORDS.has(name.toLowerCase());
+  if (meaningless) {
+    const backendBit = backend ? ` <span class="text-muted">(${esc(backend)})</span>` : '';
+    return `<span class="text-muted">No GPU reported</span>${backendBit}`;
+  }
+  // Don't print the API twice: "Apple M4 (Metal/MLX)" already says Metal.
+  const redundant = backend && name.toLowerCase().includes(String(backend).toLowerCase());
+  const backendBit = (backend && !redundant)
+    ? ` <span class="text-muted">· ${esc(backend)}</span>` : '';
+  return `${esc(name)}${backendBit}`;
+}
+
+// ── Add worker (ZIP download + one-liner install commands) — real
+//    onboarding functionality carried over from the old dashboard's
+//    "Add worker" footer control (index.html, pre-redesign). Distinct from
+//    the Dashboard toolbar's "Start workers" (which nudges already-
+//    configured farmctl workers) — this is for bringing a NEW machine in. ──
+
+document.getElementById('btnAddWorker').innerHTML = `${icon('download')} Add worker`;
+
+const addWorkerBackdrop = document.getElementById('addWorkerBackdrop');
+// NOTE: visibility is driven by the .hidden class (see www/CLAUDE.md /
+// sky.html convention), not the native `hidden` attribute/IDL property —
+// .dialog-backdrop sets `display: grid` as an author rule, which beats the
+// UA stylesheet's `[hidden] { display: none }` regardless of the `hidden`
+// attribute, so an element that only carries `hidden` renders open anyway.
+function closeAddWorker() { addWorkerBackdrop.classList.add('hidden'); }
+addWorkerBackdrop.addEventListener('click', (e) => { if (e.target === addWorkerBackdrop) closeAddWorker(); });
+document.getElementById('addWorkerClose').innerHTML = icon('x');
+document.getElementById('addWorkerClose').addEventListener('click', closeAddWorker);
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !addWorkerBackdrop.classList.contains('hidden')) closeAddWorker();
+});
+
+document.getElementById('btnAddWorker').addEventListener('click', () => {
+  const serverUrl = window.location.origin;
+  const nix = `curl -sL ${serverUrl}/api/worker/download -o exonit-worker.zip && unzip -o exonit-worker.zip && cd exonit-worker && python3 install.py`;
+  const win = `Invoke-WebRequest ${serverUrl}/api/worker/download -OutFile exonit-worker.zip; Expand-Archive exonit-worker.zip -Force; cd exonit-worker; python install.py`;
+  document.getElementById('addWorkerBody').innerHTML = `
+    <p>Run on any machine with Python 3.10+ — the installer auto-detects OS, GPU and connects
+      to this server. Works on Linux, macOS, Windows and Raspberry Pi.</p>
+    <p class="text-muted">Linux / macOS</p>
+    <div class="raw-json"><pre id="addWorkerCmdNix">${esc(nix)}</pre></div>
+    <button type="button" class="btn btn-secondary" data-copy-target="addWorkerCmdNix">Copy</button>
+    <p class="text-muted">Windows PowerShell</p>
+    <div class="raw-json"><pre id="addWorkerCmdWin">${esc(win)}</pre></div>
+    <button type="button" class="btn btn-secondary" data-copy-target="addWorkerCmdWin">Copy</button>
+  `;
+  addWorkerBackdrop.classList.remove('hidden');
+});
+
+document.getElementById('addWorkerBody').addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-copy-target]');
+  if (!btn) return;
+  const text = document.getElementById(btn.getAttribute('data-copy-target')).textContent;
+  navigator.clipboard.writeText(text);
+  btn.textContent = 'Copied';
+  setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
+});
+
+// ── headline ──
+
+function renderHeadline(data) {
+  const computers = data.computers || [];
+  const onlineCount = computers.filter((c) => c.online).length;
+  const total = computers.length;
+  document.getElementById('headlineValue').textContent = `${fmtInt(onlineCount)} / ${fmtInt(total)}`;
+  const serverName = (data.server && data.server.name) || 'ExoNit server';
+  const serverOk = !!(data.server && data.server.healthy);
+  document.getElementById('headlineNote').textContent =
+    `${onlineCount} of ${total} machines online · ${serverName} ${serverOk ? 'healthy' : 'not responding'}`;
+  document.getElementById('fleetTotals').innerHTML = renderFleetTotals(computers);
+}
+
+// Sums a numeric field across a list of machines, excluding null/undefined
+// so a machine that has never reported a metric never silently counts as 0.
+// Returns how many machines actually contributed, so callers can say so.
+function sumField(list, field) {
+  let sum = 0, count = 0;
+  for (const c of list) {
+    const v = c[field];
+    if (v !== null && v !== undefined && !Number.isNaN(v)) { sum += v; count++; }
+  }
+  return { sum, count };
+}
+
+// Fleet-wide totals for the headline .stat-grid — all derived from the same
+// GET /api/status/fleet payload the page already polls (no extra request).
+function renderFleetTotals(computers) {
+  const online = computers.filter((c) => c.online);
+  const tiles = [];
+
+  // 1. Worker instances — across all registered machines (online + offline).
+  const instOnline = sumField(computers, 'instances_online');
+  const instTotal = sumField(computers, 'instances_total');
+  tiles.push(stat(
+    'Worker instances',
+    `${fmtInt(instOnline.sum)} / ${fmtInt(instTotal.sum)}`,
+    `${fmtInt(instOnline.sum)} of ${fmtInt(instTotal.sum)} running` +
+      (instTotal.count < computers.length ? ` · ${instTotal.count} of ${computers.length} machines reporting` : ''),
+  ));
+
+  // 2. CPU cores — online machines only; N in the note is the count that
+  //    actually reported cpu_cores, not the raw online count.
+  const cores = sumField(online, 'cpu_cores');
+  tiles.push(stat('CPU cores', fmtInt(cores.sum), `across ${fmtInt(cores.count)} machines online`));
+
+  // 3. Memory — online machines only, matched used/total pairs. The
+  //    .stat-value is 36px Fraunces; a compound "412.7 / 768.0 GB" string
+  //    was clipping/overlapping its neighbour in the narrowest grid column
+  //    (owner report 2026-07-25). Fix: the big number is the short total
+  //    capacity, and the used figure — which is the part that actually
+  //    changes moment to moment — moves to the .stat-note where 13px body
+  //    type has room for a compound value. See also the widened .stat-grid
+  //    column floor at the bottom of exonit.css, which covers every other
+  //    tile in this row (e.g. "Tasks completed" at fleet scale).
+  let ramUsed = 0, ramTotal = 0, ramCount = 0;
+  for (const c of online) {
+    if (c.ram_used_gb !== null && c.ram_used_gb !== undefined &&
+        c.ram_total_gb !== null && c.ram_total_gb !== undefined) {
+      ramUsed += c.ram_used_gb; ramTotal += c.ram_total_gb; ramCount++;
+    }
+  }
+  tiles.push(stat(
+    'Memory',
+    ramCount ? `${fmtNum(ramTotal, 1)} GB` : '—',
+    ramCount ? `${fmtNum(ramUsed, 1)} GB used across ${fmtInt(ramCount)} machines online` : `across ${fmtInt(ramCount)} machines online`,
+  ));
+
+  // 4. Average CPU load — instance-weighted mean over online machines that
+  //    report cpu_percent; falls back to an unweighted mean when none of
+  //    them carry an instance count.
+  const cpuRows = online.filter((c) => c.cpu_percent !== null && c.cpu_percent !== undefined);
+  let avgCpu = null;
+  if (cpuRows.length) {
+    const weighted = cpuRows.filter((c) => c.instances_online !== null && c.instances_online !== undefined && c.instances_online > 0);
+    if (weighted.length) {
+      const wsum = weighted.reduce((a, c) => a + c.cpu_percent * c.instances_online, 0);
+      const wtotal = weighted.reduce((a, c) => a + c.instances_online, 0);
+      avgCpu = wsum / wtotal;
+    } else {
+      avgCpu = cpuRows.reduce((a, c) => a + c.cpu_percent, 0) / cpuRows.length;
+    }
+  }
+  tiles.push(stat('Average CPU load', avgCpu === null ? '—' : `${fmtNum(avgCpu, 1)}%`, `across ${fmtInt(cpuRows.length)} machines online`));
+
+  // 5. GPU machines busy — >=50% util among online machines that report it.
+  const gpuRows = online.filter((c) => c.gpu_util_pct !== null && c.gpu_util_pct !== undefined);
+  const gpuBusy = gpuRows.filter((c) => c.gpu_util_pct >= 50).length;
+  tiles.push(stat('GPU machines busy', fmtInt(gpuBusy), `of ${fmtInt(gpuRows.length)} reporting GPU telemetry`));
+
+  // 6. Tasks completed — across ALL machines (online + offline carry a count too).
+  const tasks = sumField(computers, 'tasks_completed');
+  tiles.push(stat(
+    'Tasks completed',
+    fmtInt(tasks.sum),
+    tasks.count < computers.length
+      ? `${fmtInt(tasks.count)} of ${fmtInt(computers.length)} machines reporting`
+      : `across ${fmtInt(computers.length)} machines`,
+  ));
+
+  // 7. Offline — omitted entirely when there are none, per spec.
+  const offlineCount = computers.filter((c) => c.online === false).length;
+  if (offlineCount > 0) {
+    tiles.push(stat('Offline', fmtInt(offlineCount), 'not reporting'));
+  }
+
+  return tiles.join('');
+}
+
+// ── fleet map (hand-drawn star topology, recolored via CSS classes on
+//    tokens only — no inline hex, no red/green/yellow semaphore) ──
+
+function drawMap(server, computers) {
+  const NS = 'http://www.w3.org/2000/svg';
+  const svg = document.getElementById('fleetSvg');
+  svg.innerHTML = '';
+  const W = 800, H = 460;
+  const cx = W / 2, cy = H / 2;
+  const R = Math.min(W, H) * 0.36;
+  const n = computers.length || 1;
+
+  // Spokes first, so nodes sit on top.
+  computers.forEach((cm, i) => {
+    const a = (i / n) * 2 * Math.PI - Math.PI / 2;
+    const x = cx + R * Math.cos(a), y = cy + R * Math.sin(a);
+    const line = document.createElementNS(NS, 'line');
+    line.setAttribute('x1', cx); line.setAttribute('y1', cy);
+    line.setAttribute('x2', x); line.setAttribute('y2', y);
+    line.setAttribute('class', cm.online ? 'link link-active' : 'link');
+    svg.appendChild(line);
+  });
+
+  const serverHealthy = !!(server && server.healthy);
+  drawNode(svg, cx, cy, {
+    label: (server && server.name) || 'Server',
+    sub2: serverHealthy ? '' : 'not responding',
+  }, true, serverHealthy);
+
+  computers.forEach((cm, i) => {
+    const a = (i / n) * 2 * Math.PI - Math.PI / 2;
+    const x = cx + R * Math.cos(a), y = cy + R * Math.sin(a);
+    const gpuBit = cm.gpu_util_pct !== null && cm.gpu_util_pct !== undefined ? ` · ${fmtNum(cm.gpu_util_pct, 0)}%` : '';
+    drawNode(svg, x, y, {
+      label: cm.friendly_name,
+      sub: `${cm.online ? 'online' : 'offline'} · ${fmtInt(cm.instances_online)}/${fmtInt(cm.instances_total)} workers${gpuBit}`,
+      sub2: cm.gpu_temp_c !== null && cm.gpu_temp_c !== undefined ? `${fmtNum(cm.gpu_temp_c, 1)}°C` : '',
+    }, false, cm.online);
+  });
+}
+
+// Node state is NEVER color-only (spec §6.4): every node carries its status
+// as text alongside the fill (server: "not responding" when unhealthy;
+// machines: an explicit "online"/"offline" word ahead of the worker count).
+function drawNode(svg, x, y, info, isServer, online) {
+  const NS = 'http://www.w3.org/2000/svg';
+  const g = document.createElementNS(NS, 'g');
+  // A server that isn't healthy renders with the same muted/offline fill as
+  // a dead machine, not the always-on accent box the class name implies —
+  // .node-server sets its own fill, so an unhealthy server explicitly
+  // borrows .node-offline's rect styling instead (last class in source order
+  // wins the `rect` fill/stroke declaration; label sizing stays server-scale).
+  const stateClass = isServer
+    ? (online ? 'node-server' : 'node-server node-offline')
+    : (online ? 'node-online' : 'node-offline');
+  g.setAttribute('class', stateClass);
+
+  const r = isServer ? 22 : 18;
+  const rect = document.createElementNS(NS, 'rect');
+  rect.setAttribute('x', x - r); rect.setAttribute('y', y - r);
+  rect.setAttribute('width', r * 2); rect.setAttribute('height', r * 2);
+  rect.setAttribute('rx', 6);
+  // .node-server's accent drop-shadow is a same-property-count tie with
+  // .node-offline on fill/stroke (last class in source order wins), but
+  // `filter` only exists on the server rule, so it would otherwise survive
+  // on an unhealthy server's now-muted box — suppress it explicitly.
+  if (isServer && !online) rect.style.filter = 'none';
+  g.appendChild(rect);
+
+  // .node-label-server's text fill (--accent-ink, dark navy) is only legible
+  // over the accent-filled server box — an unhealthy server falls back to
+  // .node-offline's muted fill, so its label must fall back to the light
+  // .node-label ink too, or the text disappears against the dark background.
+  const label = document.createElementNS(NS, 'text');
+  label.setAttribute('x', x); label.setAttribute('y', y + 3);
+  label.setAttribute('text-anchor', 'middle');
+  label.setAttribute('class', (isServer && online) ? 'node-label-server' : 'node-label');
+  label.textContent = String(info.label || '').slice(0, 14);
+  g.appendChild(label);
+
+  const sub = document.createElementNS(NS, 'text');
+  sub.setAttribute('x', x); sub.setAttribute('y', y + r + 14);
+  sub.setAttribute('text-anchor', 'middle');
+  sub.setAttribute('class', 'node-sublabel');
+  sub.textContent = info.sub || '';
+  if (info.sub) g.appendChild(sub);
+
+  if (info.sub2) {
+    const sub2 = document.createElementNS(NS, 'text');
+    sub2.setAttribute('x', x); sub2.setAttribute('y', y + (info.sub ? r + 24 : r + 14));
+    sub2.setAttribute('text-anchor', 'middle');
+    sub2.setAttribute('class', 'node-sublabel');
+    sub2.textContent = info.sub2;
+    g.appendChild(sub2);
+  }
+
+  svg.appendChild(g);
+}
+
+// ── per-machine table ──
+
+function renderComputers(computers) {
+  const tbody = document.getElementById('computersBody');
+  if (!computers.length) {
+    tbody.innerHTML = '<tr><td colspan="13" class="fleet-empty">No machines registered yet.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = computers.map((c) => {
+    const osLabel = OS_LABEL[c.platform] || (c.platform ? esc(c.platform) : '—');
+    const osTitle = c.platform ? '' : ' title="This machine has not reported its OS."';
+    // Same reserved-color rule as the workers table above.
+    const statusTag = c.status === 'offline'
+      ? tag('offline', 'neutral')
+      : c.status === 'working'
+        ? tag('working', 'outline')
+        : tag('idle', 'ok');
+    return `<tr>
+      <td>${esc(c.friendly_name)}</td>
+      <td${osTitle}>${osLabel}</td>
+      <td>${statusTag}</td>
+      <td class="num">${fmtInt(c.instances_online)} / ${fmtInt(c.instances_total)}</td>
+      <td>${renderGpuCell(c)}</td>
+      <td>${occBarPct(c.cpu_percent)}</td>
+      <td>${occBarGB(c.ram_used_gb, c.ram_total_gb)}</td>
+      <td>${occBarPct(c.gpu_util_pct)}</td>
+      <td class="num">${fmtGB(c.gpu_mem_used_gb, c.gpu_mem_total_gb)}</td>
+      <td class="num">${c.gpu_temp_c === null || c.gpu_temp_c === undefined ? '—' : `${fmtNum(c.gpu_temp_c, 1)}°C`}</td>
+      <td class="num">${c.gpu_power_w === null || c.gpu_power_w === undefined ? '—' : `${fmtNum(c.gpu_power_w, 1)} W`}</td>
+      <td class="num">${fmtInt(c.tasks_completed)}</td>
+      <td class="num">${fmtAgo(c.last_heartbeat_ago)}</td>
+    </tr>`;
+  }).join('');
+}
+
+// ── workers table (absorbed from dashboard-workers.html) ──
+
+let selectedWorker = null;
+let lastLiveWorkers = [];
+
+// Multi-instance computers register as "worker-<base>-1..N" — group by the
+// name with the trailing instance number stripped, same heuristic the old
+// dashboard used for its "stop computer" dropdown.
+const computerOf = (name) => String(name || '').replace(/-\d+$/, '');
+
+// Owner request 2026-07-25: sort the workers table by Avg (s) ascending
+// (fastest first) — this is only really meaningful during the scan phase,
+// but that's an observation about when the number is interesting, not a
+// request for phase-conditional sorting, so this is one unconditional
+// comparator applied every time, regardless of phase.
+//
+// Trap: `avg_seconds_per_star` is null/0/absent for a worker that hasn't
+// timed a star yet (e.g. just started, or mid-download/mid-vetting with no
+// scan average). A naive ascending sort on that raw value would put those
+// unknowns FIRST, as if a worker with no data were infinitely fast — wrong.
+// Treat null/0/absent as "unknown" and always sort it to the end.
+//
+// Secondary key: worker name, ascending. Without a stable tiebreaker, rows
+// with equal (or equally-unknown) averages can swap order on every 15s
+// poll purely from array-order noise in the payload, which reads as the
+// table jittering on a page nobody touched.
+function sortWorkersByAvg(workers) {
+  const known = (w) => w.avg_seconds_per_star !== null && w.avg_seconds_per_star !== undefined
+    && !Number.isNaN(w.avg_seconds_per_star) && w.avg_seconds_per_star > 0;
+  return workers.slice().sort((a, b) => {
+    const ka = known(a), kb = known(b);
+    if (ka !== kb) return ka ? -1 : 1; // known avg before unknown, always
+    if (ka && kb && a.avg_seconds_per_star !== b.avg_seconds_per_star) {
+      return a.avg_seconds_per_star - b.avg_seconds_per_star;
+    }
+    return String(a.name || '').localeCompare(String(b.name || ''));
+  });
+}
+
+// Console-live worker count reuses the same /api/worker/list data the page
+// already polls — no extra request just to feed the nav (spec §4).
+function updateConsoleLiveCount(count) {
+  const dot = document.getElementById('consoleLiveDot');
+  const countEl = document.getElementById('consoleLiveCount');
+  if (!dot || !countEl) return;
+  countEl.textContent = `${fmtInt(count)} worker${count === 1 ? '' : 's'}`;
+  dot.classList.toggle('is-down', count === 0);
+}
+
+function renderWorkers(workers) {
+  const tbody = document.getElementById('workersBody');
+  // Server already drops true zombies from the registry after
+  // WORKER_OFFLINE_SECONDS, but dead Spot instances can still surface here
+  // briefly with online=false; filter them out (parity with the old
+  // dashboard-workers.html behavior).
+  const live = sortWorkersByAvg(workers.filter((w) => w.online));
+  lastLiveWorkers = live;
+  renderStopComputerControl(live);
+  updateConsoleLiveCount(live.length);
+  if (!live.length) {
+    tbody.innerHTML = '<tr><td colspan="10" class="workers-empty">No workers online — start a scan to bring the fleet up.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = live.map((w) => {
+    // Reserved state colors (spec §2.4), never --accent (interaction-only):
+    // idle is --ok (healthy, waiting), an active phase is a neutral outline
+    // (busy is information, not a verdict).
+    const statusTag = w.status === 'idle' ? tag('idle', 'ok') : tag(w.status || 'working', 'outline');
+    const tic = w.current_tic
+      ? `${esc(w.current_tic)}${w.current_task ? ` (${esc(w.current_task)})` : ''}`
+      : '—';
+    const debugOn = !!w.debug_mode;
+    // Stop is asynchronous: the server queues the shutdown command and the
+    // worker picks it up on its next heartbeat (<=30s), same contract as
+    // the old dashboard's per-row stop button. Row controls use .btn-ghost/
+    // .btn-icon (spec §5) instead of the old shrunk .debug-btn override, so
+    // every control keeps the system's 36px hit-target floor.
+    const stopCell = w.status === 'offline'
+      ? '<span class="text-muted">—</span>'
+      : `<button type="button" class="btn btn-icon btn-ghost" data-stop-wid="${esc(w.worker_id)}" data-stop-name="${esc(w.name)}" aria-label="Stop ${esc(w.name)}" title="Stop ${esc(w.name)}">${icon('square')}</button>`;
+    return `<tr class="worker-row" data-wid="${esc(w.worker_id)}">
+      <td>${esc(w.name)}</td>
+      <td>${statusTag}</td>
+      <td>${tic}</td>
+      <td>${esc(w.phase || '—')}</td>
+      <td class="num">${fmtPct(w.phase_progress)}</td>
+      <td class="num">${fmtInt(w.stars_completed)}</td>
+      <td class="num">${w.avg_seconds_per_star ? `${fmtNum(w.avg_seconds_per_star, 1)} s` : '—'}</td>
+      <td class="num">${fmtAgo(w.last_heartbeat_ago)}</td>
+      <td><button type="button" class="btn btn-ghost${debugOn ? ' btn-pressed' : ''}"
+        data-debug-wid="${esc(w.worker_id)}" data-debug-enable="${debugOn ? 'false' : 'true'}"
+        aria-label="${debugOn ? 'Disable' : 'Enable'} debug for ${esc(w.name)}">
+        ${icon(debugOn ? 'check' : 'x')} ${debugOn ? 'Debug on' : 'Debug off'}</button></td>
+      <td>${stopCell}</td>
+    </tr>`;
+  }).join('');
+}
+
+// ── Stop computer: bulk-stop every online worker instance on one machine
+//    (name-prefix grouping) — a scoped .controls row above the table, not
+//    a page toolbar; it acts only on this table's own data. ──
+
+document.getElementById('btnStopComputer').innerHTML = `${icon('square')} Stop computer`;
+
+function renderStopComputerControl(live) {
+  const row = document.getElementById('stopComputerRow');
+  const sel = document.getElementById('computerSelect');
+  const computers = [...new Set(live.map((w) => computerOf(w.name)))].sort();
+  if (!computers.length) {
+    row.classList.add('hidden');
+    return;
+  }
+  row.classList.remove('hidden');
+  const prev = sel.value;
+  sel.innerHTML = computers.map((c) => `<option value="${esc(c)}">${esc(c)}</option>`).join('');
+  sel.value = computers.includes(prev) ? prev : computers[0];
+}
+
+async function controlWorker(wid, command, name) {
+  const note = document.getElementById('stopComputerNote');
+  try {
+    await postJSON('/api/worker/control', { worker_id: wid, command });
+    note.textContent = `${command} queued for ${name} — picks up on next heartbeat (<=30s).`;
+  } catch (err) {
+    note.textContent = `${command} failed for ${name}: ${err.message}`;
+  }
+  const data = await getJSON('/api/worker/list');
+  renderWorkers(data.workers || []);
+  if (selectedWorker) await renderDetail(selectedWorker);
+}
+
+async function stopComputer() {
+  const computer = document.getElementById('computerSelect').value;
+  const note = document.getElementById('stopComputerNote');
+  if (!computer) return;
+  const targets = lastLiveWorkers.filter((w) => computerOf(w.name) === computer);
+  if (!targets.length) { note.textContent = `No online workers on ${computer}.`; return; }
+  if (!confirm(`Stop all ${targets.length} worker(s) on ${computer}?`)) return;
+  let ok = 0, fail = 0;
+  await Promise.all(targets.map(async (w) => {
+    try {
+      await postJSON('/api/worker/control', { worker_id: w.worker_id, command: 'shutdown' });
+      ok++;
+    } catch { fail++; }
+  }));
+  note.textContent = `Stop queued for ${ok} worker(s) on ${computer}${fail ? ` (${fail} failed)` : ''} — picks up on next heartbeat (<=30s).`;
+  const data = await getJSON('/api/worker/list');
+  renderWorkers(data.workers || []);
+}
+document.getElementById('btnStopComputer').addEventListener('click', stopComputer);
+
+async function toggleDebug(wid, enable) {
+  try {
+    await postJSON(`/api/debug/${encodeURIComponent(wid)}`, { enabled: enable });
+  } catch (err) {
+    console.error('[status] debug toggle failed:', err);
+  }
+  const data = await getJSON('/api/worker/list');
+  renderWorkers(data.workers || []);
+  if (selectedWorker) await renderDetail(selectedWorker);
+}
+
+async function selectWorker(wid) {
+  selectedWorker = wid;
+  await renderDetail(wid);
+}
+
+async function renderDetail(wid) {
+  const el = document.getElementById('workerDetail');
+  let data;
+  try {
+    data = await getJSON(`/api/telemetry/${encodeURIComponent(wid)}?limit=30`);
+  } catch (err) {
+    el.innerHTML = `<div class="hr"></div><p class="text-muted">Could not load telemetry for ${esc(wid)}.</p>`;
+    return;
+  }
+  const records = (data.records || []).slice().reverse();
+  let html = `<div class="hr"></div><h4>Telemetry — ${esc(wid)}</h4>`;
+
+  const timings = records.filter((r) => (r.star_elapsed_s || r.avg_time_per_star) > 0);
+  if (timings.length) {
+    const max = Math.max(...timings.map((r) => r.star_elapsed_s || r.avg_time_per_star || 1));
+    html += '<h5>Processing time trend</h5>';
+    html += timings.map((r) => {
+      const val = r.star_elapsed_s || r.avg_time_per_star;
+      const pct = Math.max(2, Math.min(100, (val / max) * 100));
+      const label = r.current_tic ? `TIC ${r.current_tic}` : '—';
+      return `<div class="meter meter-time"><span>${esc(label)}</span>` +
+        `<span class="bar bar-sm"><i style="width: ${pct}%"></i></span>` +
+        `<span class="meter-val">${fmtNum(val, 1)} s</span></div>`;
+    }).join('');
+  } else {
+    html += '<p class="text-muted">No timing samples yet.</p>';
+  }
+
+  const lastSys = records.find((r) => r.cpu_percent !== null && r.cpu_percent !== undefined);
+  if (lastSys) {
+    html += '<h5>System metrics</h5><div class="facts">';
+    html += `<div><span>CPU</span><span class="num">${fmtNum(lastSys.cpu_percent, 1)}%</span></div>`;
+    html += `<div><span>RAM</span><span class="num">${fmtNum(lastSys.ram_used_gb, 1)} / ${lastSys.ram_total_gb != null ? fmtNum(lastSys.ram_total_gb, 1) : '—'} GB</span></div>`;
+    if (lastSys.cpu_temp_c !== null && lastSys.cpu_temp_c !== undefined) {
+      html += `<div><span>Temp</span><span class="num">${fmtNum(lastSys.cpu_temp_c, 1)}°C</span></div>`;
+    }
+    html += `<div><span>RSS</span><span class="num">${fmtNum(lastSys.pid_rss_mb, 1)} MB</span></div>`;
+    html += '</div>';
+  }
+
+  const lastErr = records.find((r) => r.last_error);
+  if (lastErr) {
+    html += `<div class="card card-alert"><div class="facts"><div><span>Last error</span><span>${esc(lastErr.last_error)}</span></div></div></div>`;
+  }
+
+  el.innerHTML = html;
+}
+
+document.getElementById('workersBody').addEventListener('click', (ev) => {
+  const debugBtn = ev.target.closest('[data-debug-wid]');
+  if (debugBtn) {
+    ev.stopPropagation();
+    toggleDebug(debugBtn.getAttribute('data-debug-wid'), debugBtn.getAttribute('data-debug-enable') === 'true');
+    return;
+  }
+  const stopBtn = ev.target.closest('[data-stop-wid]');
+  if (stopBtn) {
+    ev.stopPropagation();
+    controlWorker(stopBtn.getAttribute('data-stop-wid'), 'shutdown', stopBtn.getAttribute('data-stop-name'));
+    return;
+  }
+  const row = ev.target.closest('.worker-row');
+  if (row) selectWorker(row.getAttribute('data-wid'));
+});
+
+// ── polling ──
+
+const fleetHandle = poll(async () => {
+  const data = await getJSON('/api/status/fleet');
+  renderHeadline(data);
+  drawMap(data.server, data.computers || []);
+  renderComputers(data.computers || []);
+}, 5000);
+staleNote(document.getElementById('fleetStale'), fleetHandle);
+
+const workersHandle = poll(async () => {
+  const data = await getJSON('/api/worker/list');
+  renderWorkers(data.workers || []);
+  if (selectedWorker) await renderDetail(selectedWorker);
+}, 15000);
+staleNote(document.getElementById('workersStale'), workersHandle);
+</script>
+</body>
+</html>

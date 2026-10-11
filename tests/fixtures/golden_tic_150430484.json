@@ -1,0 +1,64 @@
+{
+  "task_id": "fixture_150430484",
+  "tic_id": "150430484",
+  "ra": 282.4567,
+  "dec": -1.2345,
+  "tmag": 10.53,
+  "n_sectors": 4,
+  "n_points": 52000,
+  "time_span_days": 1400.0,
+  "candidates": [
+    {
+      "candidate_num": 1,
+      "period_days": 5.154,
+      "t0": 1325.678,
+      "duration_days": 0.12,
+      "depth_ppm": 1635.0,
+      "snr": 45.2,
+      "cnn_score": 0.95,
+      "triceratops_fpp": 0.001
+    }
+  ],
+  "cnn_scores": [
+    0.95
+  ],
+  "completeness": {
+    "details": [
+      {"radius_earth": 0.5, "period_days": 1.0, "detection_prob": 0.15},
+      {"radius_earth": 0.5, "period_days": 2.0, "detection_prob": 0.10},
+      {"radius_earth": 0.5, "period_days": 5.0, "detection_prob": 0.05},
+      {"radius_earth": 0.5, "period_days": 10.0, "detection_prob": 0.02},
+      {"radius_earth": 1.0, "period_days": 1.0, "detection_prob": 0.85},
+      {"radius_earth": 1.0, "period_days": 2.0, "detection_prob": 0.78},
+      {"radius_earth": 1.0, "period_days": 5.0, "detection_prob": 0.62},
+      {"radius_earth": 1.0, "period_days": 10.0, "detection_prob": 0.35},
+      {"radius_earth": 2.0, "period_days": 1.0, "detection_prob": 0.98},
+      {"radius_earth": 2.0, "period_days": 2.0, "detection_prob": 0.95},
+      {"radius_earth": 2.0, "period_days": 5.0, "detection_prob": 0.88},
+      {"radius_earth": 2.0, "period_days": 10.0, "detection_prob": 0.65},
+      {"radius_earth": 4.0, "period_days": 1.0, "detection_prob": 1.0},
+      {"radius_earth": 4.0, "period_days": 5.0, "detection_prob": 0.97},
+      {"radius_earth": 4.0, "period_days": 10.0, "detection_prob": 0.90}
+    ]
+  },
+  "processing_time_seconds": 185.3,
+  "gpu_used": true,
+  "timings": {
+    "load": 0,
+    "bls": 0,
+    "vetting": 0,
+    "cnn": 0,
+    "injection": 0,
+    "total": 185.3,
+    "gpu_backend": "cuda",
+    "n_candidates": 1
+  },
+  "_meta": {
+    "generated_at": "2026-04-15T21:13:44.157626Z",
+    "generator_version": "v0.2.0",
+    "source": "golden_fixture_tic_150430484",
+    "expected_period_days": 5.154,
+    "expected_depth_ppm": 1635,
+    "note": "TOI 5671.01, 4 sectors, E2E reference"
+  }
+}

@@ -1,0 +1,176 @@
+[workspace]
+resolver = "2"
+members = ["crates/exonit-core", "crates/exonit-worker"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+# `float_roundtrip` matters here: without it, serde_json's default float
+# parser is a fast approximation that is NOT always correctly rounded to the
+# last bit (confirmed empirically in F1: it mis-parsed a literal from a
+# golden fixture 1 ULP off vs both Rust's std f64::from_str and the Python/
+# astropy value that produced it). This is exactly the determinism gate
+# CLAUDE.md requires for golden-fixture parity, so it is non-negotiable here.
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+libc = "0.2"
+# F0b HTTP client, per DESIGN.md's F0 dependency allowlist ("ureq v3 with
+# rustls; it is the only HTTP crate permitted"). `default-features = false`
+# drops ureq's default native-tls dependency in favour of rustls (a
+# workspace-wide pure-Rust TLS stack, no OpenSSL/native-tls linkage); `json`
+# is not strictly required (dto.rs types are serialized via serde_json
+# directly) but keeps `ureq::Agent::configure().http_status_as_error` et al.
+# ergonomic and matches upstream's common pairing.
+ureq = { version = "3.3.0", default-features = false, features = ["rustls", "json"] }
+# F0b durable outbox, per DESIGN.md's F0 dependency allowlist ("rusqlite with
+# feature \"bundled\""). `bundled` compiles SQLite from source instead of
+# requiring a system libsqlite3 — matches the "easy install on Windows/
+# Linux/macOS, no Docker" norm in project rule 4.
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+# F3 ONNX Runtime binding (CNN FFI + ExoMiner FFI), per DESIGN.md's F3
+# allowlist ("new dependency allowed ONLY: `ort`"). `ort` v2
+# (pyke.io's Rust ONNX Runtime wrapper) is the only actively maintained
+# ONNX crate with first-class Windows+Linux+macOS support (needed per
+# project rule 4/DESIGN.md's <host>-future goal) and a CUDA EP for F4.
+# Pinned to the latest 2.0.0 RC (crates.io has no 2.0.0 stable yet; 1.x is
+# EOL upstream) — it built and linked cleanly against ONNX Runtime 1.28 on
+# first try (<host>, 2026-08-05), so no fallback to an older series was
+# needed.
+#
+# Linking strategy: default feature `download-binaries` (kept — no feature
+# override below) downloads a prebuilt `libonnxruntime.a` for the host
+# triple from pyke's CDN at BUILD time via `ort-sys`'s build script, caches
+# it under `~/.cache/ort.pyke.io/`, and links it STATICALLY into the
+# binary — no `.so`/`.dll` to ship alongside the worker, no system
+# ONNX Runtime install, matching project rule 4 ("workers must install
+# easily on Windows/Linux/macOS, Docker is not an option"). Requires
+# network at first build on a given host (<host> has it; verify before
+# building on an air-gapped host). Confirmed bit-identical f32 model
+# outputs vs the Python worker's onnxruntime 1.27.0 on both `cnn_ffi_v1`
+# and `exominer_ffi_v6_ensemble` before writing any Rust code (see F3
+# session notes in docs/PLAN.md).
+#
+# `cuda` is NOT enabled here (F4, feature `cuda` below is a passthrough to
+# `ort`'s own `cuda` feature — see `onnx_cnn.rs`/`onnx_exominer.rs` module
+# docs for the exact swap point).
+ort = { version = "2.0.0-rc.13", default-features = true }
+# F4a CUDA driver + NVRTC binding for the primary BLS kernels (see
+# `bls/cuda.rs`'s module doc comment). `cudarc` is the only actively
+# maintained safe Rust CUDA driver-API wrapper with a runtime dynamic-
+# loading mode (see below) — the alternative, `rustacuda`, is unmaintained
+# since 2021.
+#
+# `default-features = false` + explicit feature list, because the crate
+# default pulls in cuBLAS/cuBLASLt/cuRAND/the CUDA *runtime* API and a
+# fixed-latest CUDA version — none of which this crate needs (only the
+# Driver API + NVRTC, to mirror `bls_cuda.py`'s `cp.RawKernel`/driver-level
+# launch exactly):
+#   - `driver`: the CUDA Driver API (context/stream/module/kernel-launch —
+#     everything `cuda.rs` uses).
+#   - `nvrtc`: runtime PTX compilation from the kernel source strings in
+#     `cuda_kernels/*.cu`, the same NVRTC JIT path CuPy's `RawKernel` uses.
+#   - `dynamic-loading`: NO link-time dependency on libcuda/libnvrtc — both
+#     are `dlopen()`-ed lazily at first use via `libloading`, searching the
+#     normal dynamic-linker path (LD_LIBRARY_PATH included). This is what
+#     makes the crate **compile** on <host> (no NVIDIA GPU, no CUDA
+#     toolkit installed) — `static-linking`/`dynamic-linking` would fail at
+#     link time here. Runs only where the driver/NVRTC .so are actually
+#     found at runtime (<host>; see docs/PLAN.md's F4 LD_LIBRARY_PATH
+#     notes for the exact paths, taken from `ops/workers.json`'s
+#     worker-<host> entry).
+#   - `cuda-12080`: selects the CUDA 12.8 driver-API struct/enum layout
+#     (a compile-time constant selection, NOT a build-time toolkit probe —
+#     `cuda-version-from-build-system` would need `nvcc` present, which
+#     <host> does not have). 12.8 is the first CUDA release with sm_120
+#     (Blackwell, RTX 5060 Ti's "compute 12.0") support; <host>'s pip
+#     `nvidia-cuda-nvrtc-cu12`/`cupy-cuda12x` stack is >=12.8 (it already
+#     JIT-compiles for this GPU today). The CUDA Driver API is
+#     backward-compatible across minor versions, so an even newer installed
+#     driver/NVRTC still works against these 12.8 struct layouts.
+#
+#     THIS ENTRY IS UNIX-ONLY as of Task 4 of
+#     docs/plans/2026-08-06-win32-port-pcmarc.md: this `cuda-XXXXX` feature
+#     also drives the candidate DLL/SO filenames `dynamic-loading` searches
+#     for (`cudarc::get_lib_name_candidates`), not just the struct layout —
+#     `cuda-12080` on <host> (CUDA 13.2 toolkit, `nvrtc64_130_0.dll`) made
+#     `CudaBlsBackend::probe()` fail outright (no "13"-prefixed candidate
+#     ever generated). `crates/exonit-core/Cargo.toml` now declares cudarc
+#     per-target (`[target.'cfg(unix)'.dependencies]` keeps this workspace
+#     entry as-is; `[target.'cfg(windows)'.dependencies]` pins
+#     `cuda-13020` instead — see that Cargo.toml's comment for the full
+#     story). This workspace-level entry is what <host>/<host> actually
+#     builds against; <host>'s build never touches it.
+#   - `std`: this crate is not `no_std`.
+cudarc = { version = "0.19.8", default-features = false, features = [
+    "driver",
+    "nvrtc",
+    "dynamic-loading",
+    "cuda-12080",
+    "std",
+] }
+# F7 CPU BLS parallelization (already flagged as a planned dependency in
+# docs/DESIGN.md's dependency list: "rayon"). BENCHMARKS.md's 2026-08-05 A/B
+# measured BLS two-pass CPU at 0,070× vs numba's `prange`-parallel Python
+# (16 threads) on the same host — the single biggest remaining CPU gap.
+# `rayon` is the de facto standard Rust data-parallelism crate: a
+# work-stealing thread pool with an `IntoParallelIterator`/`map_init` API
+# that lets each period's independent BLS evaluation write into its own
+# indexed output slot (see `bls/optimized.rs`'s module doc comment) with NO
+# shared mutable accumulator between threads — required for the bit-for-bit
+# determinism gate in CLAUDE.md/this crate's DESIGN.md ("same
+# iteration/reduction order and tie-breaking as the reference"). Building a
+# `rayon::ThreadPool` per call (not `build_global()`) is what lets
+# `max_concurrency` (mirroring `config.cpu_threads`, itself mirroring the
+# Python worker's own thread cap — CLAUDE.md rule 2, never claim all cores
+# of a host) be a genuine per-call parameter instead of a process-wide
+# singleton fixed at first use.
+rayon = "1.10"
+# F0 Win32 port (Task 2, docs/plans/2026-08-06-win32-port-pcmarc.md):
+# `platform::windows`'s Win32 API bindings. Referenced ONLY from
+# `[target.'cfg(windows)'.dependencies]` in exonit-core's Cargo.toml — the
+# Linux/<host> build never resolves or compiles either crate. Feature
+# list covers every Win32 namespace `platform::windows` calls into:
+# process query/terminate/spawn-flags (`Win32_System_Threading`), RSS
+# (`Win32_System_ProcessStatus`), CPU/RAM telemetry
+# (`Win32_System_SystemInformation`), log-file redirection
+# (`Win32_Storage_FileSystem`), console-ctrl shutdown + SetStdHandle
+# (`Win32_System_Console`), and base types (`Win32_Foundation`).
+# `Win32_Security` is NOT in the plan's original enumerated list — added
+# because `CreateFileW`'s generated binding references `SECURITY_ATTRIBUTES`
+# (confirmed by inspecting the windows-sys 0.59 source directly), so it's
+# required to resolve, not a scope expansion.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_Security",
+] }
+# F0 Win32 port: the startup lock's `LockFileEx`-backed exclusive file lock
+# (Windows analogue of Unix's `flock` via `libc`, already used elsewhere in
+# this workspace — see the `libc` entry above). `sync` (default feature)
+# is std::fs::File support; no async runtime feature needed, this worker is
+# plain-thread blocking I/O throughout (see runtime.rs's module doc
+# comment).
+fs4 = { version = "0.9", features = ["sync"] }
+# OpenCL backend for injection-recovery on non-NVIDIA GPUs (<host>'s AMD
+# Vega 10 iGPU via Mesa rusticl, and <host>'s own Intel Arc iGPU — see
+# `bls/opencl_batch.rs`'s module doc comment / docs/plans/
+# 2026-08-06-opencl-backend-<host>.md). `ocl` is the only actively
+# maintained safe(r) Rust OpenCL binding with the platform/device
+# enumeration + context/queue/program/kernel/buffer API this module needs
+# (the raw `opencl3`/`cl-sys` alternatives would mean hand-rolling the same
+# safety wrappers `ocl` already provides). `default-features` (just
+# `opencl_version_1_1`/`opencl_version_1_2`) are kept AS-IS per the plan's
+# "no dependency changes beyond `ocl`, defaults" instruction — both the Arc
+# (OpenCL 3.0, backward-compatible) and Mesa rusticl (reports itself as an
+# OpenCL 1.2/3.0 ICD) platforms this module targets are covered by the 1.2
+# API surface actually used here (platform/device enumeration, context,
+# queue, program build, buffer, kernel launch — nothing 2.0+-specific).
+# Feature-gated (`opencl`, `crates/exonit-core/Cargo.toml`), independent of
+# and compiles alongside `cuda` — see that feature's own comment.
+ocl = "0.19.7"

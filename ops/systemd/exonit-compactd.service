@@ -1,0 +1,36 @@
+# exonit-compactd: completeness compaction HTTP sidecar (stdlib only).
+#
+# Optional. Runs the heavy PostgreSQL compaction of the completeness store on a host with
+# enough RAM, so the pipeline server never has to do it in-process.
+#
+# EnvironmentFile=/etc/default/exonit-compactd carries the real EXONIT_COMPACTD_TOKEN (and any
+# override of EXONIT_COMPACTD_PORT / EXONIT_COMPACTD_PG_DSN / EXONIT_COMPACT_BATCH_ROWS). That
+# file must be root-owned with mode 0600 and must NEVER be committed. The service refuses to
+# start without a token (scripts/exonit_compactd.py::main).
+#
+# Install:
+#   sudo cp ops/systemd/exonit-compactd.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now exonit-compactd.service
+
+[Unit]
+Description=ExoNit completeness compaction service (HTTP, stdlib-only)
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=exonit
+WorkingDirectory=/opt/exonit
+# The repo is not installed as a package: PYTHONPATH is required so `import exonit`
+# resolves (the cwd is not on sys.path when python runs a script by path).
+Environment=PYTHONPATH=/opt/exonit
+ExecStart=/opt/exonit/.venv/bin/python scripts/exonit_compactd.py
+EnvironmentFile=/etc/default/exonit-compactd
+Restart=always
+RestartSec=5
+# Batch mode bounds per-job memory independently of the staging table size. Choose a value
+# that leaves headroom for PostgreSQL and the other services on the same host.
+MemoryMax=26G
+
+[Install]
+WantedBy=multi-user.target

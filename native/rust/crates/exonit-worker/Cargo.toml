@@ -1,0 +1,63 @@
+[package]
+name = "exonit-worker"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "exonit-rust-worker"
+path = "src/main.rs"
+
+# F0b E2E harness, mirrors Swift's `Sources/ExoNitFakeIntegration/main.swift`:
+# drives a real `WorkerRuntime` against `scripts/fake_exonit_server.py`
+# (register -> task -> FITS -> heartbeat -> result via outbox -> wait).
+# See docs/PLAN.md's F0b gate.
+[[bin]]
+name = "exonit-fake-integration"
+path = "src/bin/exonit_fake_integration.rs"
+
+# Rust-vs-Python A/B benchmark harness (see docs — the twin `docs/DESIGN.md`/
+# `docs/PLAN.md` in this bench-harness worktree). Local-only, no server/
+# network; calls the same exonit-core science functions `PrimaryTaskProcessor`
+# uses directly, per-stage timed. See the file's own doc comment for the
+# exact stage list and its Python twin, `scripts/benchmark_python_stages.py`.
+[[bin]]
+name = "exonit-bench"
+path = "src/bin/exonit_bench.rs"
+
+[dependencies]
+exonit-core = { path = "../exonit-core" }
+serde_json.workspace = true
+# Already a workspace dependency (exonit-core uses it for pidlock/logfile
+# POSIX calls) — needed here too for the direct worker mode's raw
+# SIGTERM/SIGINT handlers (see main.rs's `install_signal_handlers`). No new
+# dependency added to the workspace.
+libc.workspace = true
+
+[features]
+default = []
+# Passthrough to exonit-core's own `cuda` feature (see its Cargo.toml doc
+# comment) — lets `cargo build -p exonit-worker --features cuda` (or
+# `--bin exonit-bench --features cuda`) reach `bls::cuda`/the CUDA ONNX EP
+# without needing `-p exonit-core` in the same invocation.
+cuda = ["exonit-core/cuda"]
+# Passthrough to exonit-core's own `cuda-dylib` feature (2026-08-07,
+# <host> Blackwell sm_120 follow-up — see that Cargo.toml's doc
+# comment for the full rationale). Opt-in, host-specific; not part of
+# `cuda`.
+cuda-dylib = ["exonit-core/cuda-dylib"]
+# Passthrough to exonit-core's own `opencl` feature (see its Cargo.toml doc
+# comment / bls/opencl_batch.rs's module doc comment) — lets `cargo build -p
+# exonit-worker --features opencl` reach `bls::opencl_batch` and main.rs's
+# `boot_enable_rusticl()` boot call without needing `-p exonit-core` in the
+# same invocation. Independent of `cuda`; both compile together
+# (`--features "cuda opencl"`).
+opencl = ["exonit-core/opencl"]
+# Passthrough to exonit-core's own `sycl` feature (2026-08-06 Spec 2
+# integration — see its Cargo.toml doc comment / bls/sycl_batch.rs's
+# module doc comment). Independent of `cuda`/`opencl`; all three compile
+# together.
+sycl = ["exonit-core/sycl"]
+# Passthrough to exonit-core's own `ispc` feature (2026-08-06 Spec 2
+# integration — see its Cargo.toml doc comment / bls/ispc_fold.rs's module
+# doc comment). Pure-CPU, independent of every GPU feature.
+ispc = ["exonit-core/ispc"]

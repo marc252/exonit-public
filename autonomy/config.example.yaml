@@ -1,0 +1,40 @@
+# autonomy/config.example.yaml
+#
+# Configuration of the ExoNit autonomy subsystem (phase 1 — shadow mode).
+# Copy this file (e.g. to autonomy/config.yaml or wherever the
+# runbook says) and uncomment/adjust only the fields you want to override.
+# Any absent field keeps the default defined in autonomy/config.py.
+#
+# IMPORTANT (phase 1): `armed: false` is the default and means shadow mode
+# (only observes and logs, executes no real action against the infra).
+
+# URL of the ExoNit server the monitor queries for state.
+# server_url: "http://127.0.0.1:8400"
+
+# Directory where the autonomy subsystem writes its own logs/state
+# (default REPO_ROOT/data/autonomy).
+# data_dir: "/opt/exonit/data/autonomy"
+
+# Polling interval in seconds between monitor cycles.
+# poll_interval_s: 120
+
+# If true, the subsystem may execute playbooks against the real infra.
+# Phase 1: ALWAYS keep it false (shadow mode) until a later phase
+# explicitly enables it.
+# armed: false
+
+# Email notification configuration.
+mail:
+  # enabled: false
+  # to: "you@example.com"
+  # smtp_host: "smtp.gmail.com"
+  # smtp_port: 587
+  # user: ""
+  # app_password_file: ""
+
+# Host/worker health thresholds that trigger advisories.
+thresholds:
+  # disk_free_gb_warn: 25.0
+  # disk_free_gb_crit: 10.0
+  # ram_avail_gb_crit: 2.0
+  # temp_c_warn: 95.0

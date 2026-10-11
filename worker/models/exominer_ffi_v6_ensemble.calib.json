@@ -1,0 +1,16 @@
+{
+  "kind": "piecewise_linear",
+  "model": "exominer_ffi_v6_ensemble.onnx",
+  "anchor_recall": 0.85,
+  "raw_t085": 0.38930313157914914,
+  "x": [
+    0.0,
+    0.38930313157914914,
+    1.0
+  ],
+  "y": [
+    0.0,
+    0.5,
+    1.0
+  ]
+}

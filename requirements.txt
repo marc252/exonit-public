@@ -1,0 +1,27 @@
+lightkurve>=2.4
+numpy
+matplotlib
+onnxruntime
+anthropic
+requests
+pytest
+requests-mock
+fastapi>=0.100
+uvicorn>=0.20
+python-dotenv
+lightgbm>=4.0
+joblib>=1.3
+scikit-learn>=1.3
+pandas>=2.0
+pyarrow>=24.0
+h5py>=3.9
+# Core pipeline deps (imported by non-optional code: BLS/detrending, MAST
+# fetch, FPP, ops). Previously missing — a clean worker install crashed.
+scipy>=1.11
+astropy>=5.3
+astroquery>=0.4.7
+numba>=0.58
+wotan>=1.10
+triceratops>=1.0
+psutil>=5.9
+pyyaml>=6.0
