@@ -297,6 +297,7 @@ def predict_v2_1(candidate: dict, star_info: dict | None = None,
         "verdict": CLASS_NAMES[label_idx],
         "confidence": confidence,
         "model_used": f"verdict_classifier_v2_1_local ({model_name})",
+        "proba": float(proba[2]),  # raw P(planet_candidate)
     }
     from exonit.verdict_classifier import apply_planet_rescue_gate
     return apply_planet_rescue_gate(candidate, base_result)

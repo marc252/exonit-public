@@ -3336,3 +3336,18 @@ def test_lora_backlog_limit_env_parsing(monkeypatch):
         assert importlib.reload(orch).LORA_BACKLOG_LIMIT == 0
     finally:
         importlib.reload(orch)
+
+
+def test_step_postprocess_passes_sector(tmp_path):
+    lot_csv = str(tmp_path / "s0007_lot1.csv")
+    Path(lot_csv).write_text("tic_id,label\n1,candidate\n")
+    res = MagicMock(returncode=0, stdout="", stderr="")
+    with patch("subprocess.run", return_value=res) as mock_run:
+        ok, _ = orch.step_postprocess(
+            lot_csv=lot_csv, sector=7, db=str(tmp_path / "exonit.db"),
+            label="candidate", state_file=str(tmp_path / "s.json"),
+            dry_run=False, run_id="discovery_s0007_lot1_2026-01-01")
+    assert ok is True
+    cmd = next(c[0][0] for c in mock_run.call_args_list
+               if "discovery_postprocess.py" in " ".join(str(a) for a in c[0][0]))
+    assert cmd[cmd.index("--sector") + 1] == "7"

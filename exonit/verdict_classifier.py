@@ -442,7 +442,9 @@ def apply_planet_rescue_gate(candidate: dict, base_result: dict) -> dict:
         return base_result
 
     confidence = max(0.6, min(0.95, min(cnn_v, em_v)))
+    # {**base_result} carries the raw model P(planet) ("proba") through.
     return {
+        **base_result,
         "verdict": CLASS_NAMES[2],  # planet_candidate
         "confidence": confidence,
         "model_used": f"{base_result.get('model_used', '?')}+rescue",
@@ -470,6 +472,7 @@ def apply_fpp_hard_gate(candidate: dict, base_result: dict) -> dict:
     if trip is None or trip < FPP_HARD_GATE_THRESHOLD:
         return base_result
     return {
+        **base_result,
         "verdict": CLASS_NAMES[0],  # likely_false_positive
         "confidence": min(1.0, trip),
         "model_used": f"{base_result.get('model_used', '?')}+fpp_gate",
@@ -561,4 +564,5 @@ def predict_verdict(candidate: dict, vetting_result: dict,
         "verdict": CLASS_NAMES[label_idx],
         "confidence": confidence,
         "model_used": f"verdict_classifier_local ({Path(payload['path']).name})",
+        "proba": float(proba[2]),  # raw P(planet_candidate)
     }

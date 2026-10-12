@@ -89,6 +89,34 @@ def test_run_verdict_background_stores_empty_analysis_no_http(monkeypatch):
     mock_http_post.assert_not_called()
 
 
+def test_run_verdict_background_forwards_verdict_proba():
+    """result["proba"] is forwarded as the verdict_proba kwarg (P3)."""
+    from exonit.server import _run_verdict_background
+
+    db = _make_db(candidate_id=5)
+    fake = {"verdict": "planet_candidate", "confidence": 0.9,
+            "model_used": "x", "proba": 0.37}
+    with patch("exonit.verdict_classifier.predict_verdict", return_value=fake):
+        _run_verdict_background(db, tic_id=1, candidate=_sample_candidate(),
+                                cnn_score=0.8)
+    db.update_candidate_claude.assert_called_once()
+    assert db.update_candidate_claude.call_args.kwargs["verdict_proba"] == 0.37
+    assert db.update_candidate_claude.call_args[0][2] == ""
+
+
+def test_run_verdict_background_tolerates_missing_proba():
+    """Claude-fallback dicts have no "proba" key: stored as None, no crash."""
+    from exonit.server import _run_verdict_background
+
+    db = _make_db(candidate_id=6)
+    fake = {"verdict": "uncertain", "confidence": 0.5, "analysis": "t"}
+    with patch("exonit.verdict_classifier.predict_verdict", return_value=fake):
+        _run_verdict_background(db, tic_id=2, candidate=_sample_candidate(),
+                                cnn_score=0.8)
+    db.update_candidate_claude.assert_called_once()
+    assert db.update_candidate_claude.call_args.kwargs["verdict_proba"] is None
+
+
 def test_run_verdict_background_no_explainer_url_no_http(monkeypatch):
     """Even without EXONIT_EXPLAINER_URL set, analysis must still be empty."""
     from exonit.server import _run_verdict_background

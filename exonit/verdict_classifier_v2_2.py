@@ -294,6 +294,8 @@ def predict_v2_2(candidate: dict, star_info: dict | None = None,
         "verdict": CLASS_NAMES[label_idx],
         "confidence": confidence,
         "model_used": f"verdict_classifier_v2_2_local ({model_name})",
+        # raw P(planet_candidate) = (1 - p_lfp) * p_pc, both branches
+        "proba": float((1 - p_lfp) * p_pc),
     }
     if payload.get("rescue_gate", False):
         return apply_planet_rescue_gate(candidate, base_result)

@@ -444,4 +444,5 @@ def predict_v2(candidate: dict, star_info: dict | None = None,
         "verdict": CLASS_NAMES[label_idx],
         "confidence": confidence,
         "model_used": f"verdict_classifier_v2_local ({model_name})",
+        "proba": float(proba[2]),  # raw P(planet_candidate)
     }

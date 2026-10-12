@@ -396,6 +396,7 @@ if _worker_dir not in sys.path:
 from bls import run_bls, get_backend_name as _bls_backend, get_gpu_info as _bls_gpu_info, is_gpu as _bls_is_gpu, get_hardware_summary as _bls_hardware_summary, get_hardware_info as _bls_hardware_info
 from bls_fast import bls_fast, bls_two_pass, HAS_NUMBA as _has_numba
 from vetting import vet_candidate
+from duration_refine import apply_duration_refine, merge_same_period_candidates
 from cnn import TransitClassifier
 try:
     from cnn_ffi import FFITransitClassifier
@@ -2701,6 +2702,14 @@ class ExoNitWorker:
             if result["snr"] < config.get("snr_threshold", 7.0):
                 break
 
+            # Refine duration/t0/depth on a fine grid BEFORE the T14 gate and
+            # the transit mask: BLS's coarse 0.01*P duration grid leaves a
+            # mis-centred box that masks the wrong window and re-finds the
+            # same transit in later slots (TIC 4206066). Period/snr unchanged.
+            if config.get("duration_refine", False):
+                apply_duration_refine(result, time_arr, current_flux,
+                                      logger=self.logger)
+
             # Physical T14 gate: BLS allows durations up to 15% of period
             # which is ~20× the physical bound at long periods. Reject
             # candidates with T14 > 3 × T14_max_jup — these are systematics
@@ -2807,6 +2816,10 @@ class ExoNitWorker:
                     rm = bls_fn(time_arr, current_flux,
                                 period_min=med_min, period_max=med_max,
                                 n_periods=config.get("n_periods", 50000))
+                    if (config.get("duration_refine", False)
+                            and rm.get("period", 0.0) > 0):
+                        apply_duration_refine(rm, time_arr, current_flux,
+                                              logger=self.logger)
                     rm_p = rm.get("period", 0.0)
                     already = any(
                         rm_p > 0 and abs(rm_p - c["period_days"])
@@ -2921,6 +2934,7 @@ class ExoNitWorker:
                             or rl["snr"] > best_long["snr"]):
                         best_long = rl
                         best_window = long_window
+                        best_long_flux = flat_long_clean
                 if best_long is None:
                     pass  # detrend exception path below if needed
                 elif best_long["snr"] < snr_thresh:
@@ -2930,6 +2944,10 @@ class ExoNitWorker:
                         f"< {snr_thresh}, tried windows {long_windows})"
                     )
                 else:
+                    if config.get("duration_refine", False):
+                        apply_duration_refine(best_long, time_arr,
+                                              best_long_flux,
+                                              logger=self.logger)
                     t14_max_long = physical_t14_max(
                         best_long["period"],
                         star_meta.get("stellar_radius"),
@@ -2994,6 +3012,14 @@ class ExoNitWorker:
                                 )
             except Exception as e:
                 self.logger.warning(f"Long-period sweep failed: {e}")
+        # Collapse same-period duplicates (ratio ~ 1) to the max-SNR slot.
+        if config.get("merge_same_period", False):
+            _n_before = len(candidates)
+            candidates = merge_same_period_candidates(candidates)
+            if len(candidates) != _n_before:
+                self.logger.info(
+                    f"Merged same-period candidates: "
+                    f"{_n_before} -> {len(candidates)}")
         timings["bls"] = round(time.time() - t_phase, 2)
         if self.ui: self.ui.phase_done(timings["bls"])
 

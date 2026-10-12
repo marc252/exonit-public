@@ -173,6 +173,7 @@ def predict_v3_tfopwg(candidate: dict, star_info: dict | None = None,
             "verdict": CLASS_NAMES[1],  # uncertain
             "confidence": 0.0,
             "model_used": f"verdict_classifier_v3_tfopwg_local ({model_name}) (no_fpp)",
+            "proba": None,  # model not evaluated
         }
 
     X = build_v3_tfopwg_features_single(candidate, star_info, fpp_policy=fpp_policy)
@@ -196,6 +197,7 @@ def predict_v3_tfopwg(candidate: dict, star_info: dict | None = None,
         "verdict": verdict,
         "confidence": confidence,
         "model_used": f"verdict_classifier_v3_tfopwg_local ({model_name})",
+        "proba": p,
     }
 
 

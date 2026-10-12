@@ -1293,6 +1293,12 @@ def register(app, deps: ServerDeps) -> None:
         processing_time = body.get("processing_time_seconds", body.get("processing_time", 0))
         gpu_used = body.get("gpu_used", False)
 
+        # Sector of THIS result: the task row's sector (set at enqueue) wins over
+        # the pipeline state, which is None outside SCANNING (stragglers).
+        _result_sector = db.get_task_sector(task_id)
+        if _result_sector is None:
+            _result_sector = _active_run_sector()
+
         # Save star (always, even without candidates)
         tic_id = body.get("tic_id")
         candidates = body.get("candidates", [])
@@ -1337,7 +1343,7 @@ def register(app, deps: ServerDeps) -> None:
                     status=reported_status,
                 )
             if _replace_deeper:
-                _n_wiped = db.delete_candidates_for_tic(tic_id)
+                _n_wiped = db.delete_candidates_for_tic(tic_id, sector=_result_sector)
                 if _n_wiped:
                     logger.info(
                         "replace-when-deeper TIC %s: %d old candidate(s) "
@@ -1345,7 +1351,7 @@ def register(app, deps: ServerDeps) -> None:
                         tic_id, _n_wiped,
                         _old_star.get("n_sectors"), _new_n_sectors)
             if reported_status == "completed":
-                _run_sector = _active_run_sector()  # tag discovery inserts with the run's sector
+                _run_sector = _result_sector  # task-row sector, else the run's sector
                 # ExoMiner producer hook (Fase 1, Task 4) needs the star's
                 # CURRENT has_spoc value, which nothing else in this branch
                 # queries (the SPOC-gate, when enabled, resolves it

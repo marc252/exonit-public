@@ -210,7 +210,7 @@ def register(app, deps: ServerDeps) -> None:
         buf = io.StringIO()
         fields = ["tic_id", "candidate_num", "period_days", "t0",
                   "duration_days", "depth_ppm", "snr", "cnn_score",
-                  "triceratops_fpp", "claude_verdict"]
+                  "triceratops_fpp", "claude_verdict", "verdict_proba"]
         writer = csv.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         for c in candidates:

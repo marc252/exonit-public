@@ -1597,6 +1597,7 @@ def step_postprocess(
                 "--label", label,
                 "--v6-min", "0.5",
                 "--out", dossier_out,
+                "--sector", str(sector),
                 "--apply-veto",
                 "--apply-deep-eclipse-veto",
                 "--apply-depth-gate",

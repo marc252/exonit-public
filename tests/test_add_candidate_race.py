@@ -67,3 +67,62 @@ def test_add_candidate_concurrent_no_integrity_error(tmp_path):
     ).fetchall()
     con.close()
     assert not dupes, f"duplicate candidates: {dupes}"
+
+
+def _periods(path, tic="222"):
+    con = sqlite3.connect(path)
+    rows = con.execute("SELECT sector, period_days, claude_verdict FROM candidates "
+                       "WHERE tic_id=? ORDER BY sector", (tic,)).fetchall()
+    con.close()
+    return rows
+
+
+def _addp(db, period, sector, verdict=None, tic="222"):
+    return db.add_candidate(tic, 1, period, 0.0, 0.1, 100.0, 10.0,
+                            claude_verdict=verdict, sector=sector)
+
+
+def test_add_candidate_new_sector_inserts_new_row(tmp_path):
+    path = str(tmp_path / "t.db")
+    db = ExoNitDB(path)
+    id6 = _addp(db, 3.00, 6, "planet_candidate")
+    id7 = _addp(db, 6.01, 7)
+    assert id6 != id7
+    assert _periods(path) == [(6, 3.00, "planet_candidate"), (7, 6.01, None)]
+
+
+def test_add_candidate_same_sector_twice_updates_keeping_verdict(tmp_path):
+    path = str(tmp_path / "t.db")
+    db = ExoNitDB(path)
+    a = _addp(db, 3.00, 6, "planet_candidate")
+    b = _addp(db, 3.10, 6)  # force-rescan: COALESCE keeps verdict
+    assert a == b
+    assert _periods(path) == [(6, 3.10, "planet_candidate")]
+
+
+def test_add_candidate_sector_none_twice_one_row(tmp_path):
+    path = str(tmp_path / "t.db")
+    db = ExoNitDB(path)
+    _addp(db, 3.00, None)
+    _addp(db, 3.20, None)
+    assert _periods(path) == [(1, 3.20, None)]
+
+
+def test_add_candidate_explicit_then_untagged_updates_same_row(tmp_path):
+    path = str(tmp_path / "t.db")
+    db = ExoNitDB(path)
+    a = _addp(db, 3.00, 6, "planet_candidate")
+    b = _addp(db, 3.30, None)  # straggler / untagged caller
+    assert a == b
+    assert _periods(path) == [(6, 3.30, "planet_candidate")]
+
+
+def test_delete_candidates_for_tic_scoped_by_sector(tmp_path):
+    path = str(tmp_path / "t.db")
+    db = ExoNitDB(path)
+    _addp(db, 3.0, 6)
+    _addp(db, 6.0, 7)
+    assert db.delete_candidates_for_tic("222", sector=7) == 1
+    assert [r[0] for r in _periods(path)] == [6]
+    _addp(db, 6.0, 7)
+    assert db.delete_candidates_for_tic("222") == 2  # legacy: all sectors

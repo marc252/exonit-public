@@ -31,6 +31,9 @@ from exonit.db_backend import is_pg_url, make_backend, select_in_chunks
 
 logger = logging.getLogger(__name__)
 
+# Sentinel: "caller did not pass verdict_proba" (distinct from an explicit None).
+_UNSET = object()
+
 MAX_TASK_ATTEMPTS = 3
 FPP_VALIDATED = 0.015
 FPP_CANDIDATE = 0.5
@@ -626,6 +629,16 @@ class ExoNitDB:
             except sqlite3.OperationalError:
                 pass
 
+            # Migrate: verdict_proba (P3) — the verdict classifier's raw
+            # P(planet), written by update_candidate_claude. NULL = not
+            # computed (legacy rows, v3 "(no_fpp)", Claude fallback). Kept
+            # untouched by postprocess demotions on purpose (near-miss ranking).
+            try:
+                self.conn.execute(
+                    "ALTER TABLE candidates ADD COLUMN verdict_proba REAL")
+            except sqlite3.OperationalError:
+                pass
+
             # Migrate: cross-source photometric confirmation (Codex #3)
             for col, spec in [
                 ("cross_source_name", "TEXT"),
@@ -1127,10 +1140,24 @@ class ExoNitDB:
         if cross_source_agreement is not None:
             cross_source_agreement = self.dialect.bool_param(cross_source_agreement)
 
-        sel_sql = ("""SELECT id FROM candidates
-                      WHERE tic_id = ? AND candidate_num = ?
-                      ORDER BY id ASC LIMIT 1""")
-        row = self.backend.query_one(sel_sql, (tic_id, candidate_num))
+        # EXPLICIT sector: strict (tic_id, candidate_num, sector) lookup — the
+        # unique index is (sector, tic_id, candidate_num), so a TIC processed in
+        # a NEW sector INSERTs its own row instead of overwriting another
+        # sector's candidate (prerequisite for cross-sector recurrence).
+        # sector=None (untagged caller: straggler results outside SCANNING,
+        # non-discovery reprocess): legacy sector-agnostic lookup + UPDATE of
+        # the found row, so an untagged caller never creates a duplicate.
+        if sector is None:
+            sel_sql = ("""SELECT id, sector FROM candidates
+                          WHERE tic_id = ? AND candidate_num = ?
+                          ORDER BY id ASC LIMIT 1""")
+            sel_params = (tic_id, candidate_num)
+        else:
+            sel_sql = ("""SELECT id, sector FROM candidates
+                          WHERE tic_id = ? AND candidate_num = ? AND sector = ?
+                          ORDER BY id ASC LIMIT 1""")
+            sel_params = (tic_id, candidate_num, _sector)
+        row = self.backend.query_one(sel_sql, sel_params)
         if row is None:
             # No existing candidate — insert. Under uvicorn --workers N the
             # per-process lock cannot serialize across processes, so two workers
@@ -1176,11 +1203,12 @@ class ExoNitDB:
                 # (sector, tic_id, candidate_num) first. Re-fetch and update.
                 if not _is_unique_violation(exc):
                     raise
-                row = self.backend.query_one(sel_sql, (tic_id, candidate_num))
+                row = self.backend.query_one(sel_sql, sel_params)
                 if row is None:
                     raise
 
         candidate_id = row["id"]
+        _row_sector = row["sector"] if row["sector"] is not None else _sector
         self.backend.execute(
             """UPDATE candidates SET
                    period_days = ?, t0 = ?, duration_days = ?,
@@ -1199,7 +1227,7 @@ class ExoNitDB:
                    cross_source_depth_ppm = COALESCE(?, cross_source_depth_ppm),
                    cross_source_depth_ratio = COALESCE(?, cross_source_depth_ratio),
                    cross_source_agreement = COALESCE(?, cross_source_agreement)
-               WHERE id = ?""",
+               WHERE id = ? AND sector = ?""",
             (period_days, t0, duration_days, depth_ppm, snr,
              cnn_score, triceratops_fpp, triceratops_nfpp,
              triceratops_prob_planet, triceratops_verdict,
@@ -1208,11 +1236,15 @@ class ExoNitDB:
              cross_source_name, cross_source_snr,
              cross_source_depth_ppm, cross_source_depth_ratio,
              cross_source_agreement,
-             candidate_id))
+             candidate_id, _row_sector))
         return candidate_id
 
-    def delete_candidates_for_tic(self, tic_id) -> int:
-        """Delete ALL candidates of *tic_id*, any sector. Returns rows deleted.
+    def delete_candidates_for_tic(self, tic_id, sector=None) -> int:
+        """Delete candidates of *tic_id*. Returns rows deleted.
+
+        ``sector=None`` (legacy): ALL sectors. An int scopes the wipe to that
+        sector so a cross-sector re-observation cannot destroy the other
+        sectors' evidence.
 
         Support for the deep-rescan replace-when-deeper rule
         (docs/superpowers/specs/2026-07-23-deep-pass-multisector-design.md §5):
@@ -1220,6 +1252,10 @@ class ExoNitDB:
         old candidate set — per-candidate upsert would glue old FPP/verdicts
         onto signals whose period/rank changed with the longer baseline.
         """
+        if sector is not None:
+            return int(self.backend.execute_rowcount(
+                "DELETE FROM candidates WHERE tic_id = ? AND sector = ?",
+                (str(tic_id), int(sector))))
         return int(self.backend.execute_rowcount(
             "DELETE FROM candidates WHERE tic_id = ?", (str(tic_id),)))
 
@@ -1310,8 +1346,13 @@ class ExoNitDB:
                     "work_producers hook failed for candidate_id=%s",
                     candidate_id, exc_info=True)
 
-    def update_candidate_claude(self, candidate_id, verdict, analysis):
+    def update_candidate_claude(self, candidate_id, verdict, analysis,
+                                verdict_proba=_UNSET):
         """Update verdict + analysis for a candidate.
+
+        ``verdict_proba`` (raw classifier P(planet)): left as the sentinel
+        the column is not touched (legacy callers); when passed — even as
+        None — it is written, so a re-run never leaves a stale p behind.
 
         Preserves an existing `[lora-v2]`-tagged analysis if the incoming
         analysis would degrade it (empty, shorter, or untagged). The verdict
@@ -1330,15 +1371,29 @@ class ExoNitDB:
             and not incoming_is_lora
             and len(existing or "") >= len(analysis or "")
         )
+        write_proba = verdict_proba is not _UNSET
         if keep_existing:
-            self._exec(
-                "UPDATE candidates SET claude_verdict = ? WHERE id = ?",
-                (verdict, candidate_id))
+            if write_proba:
+                self._exec(
+                    "UPDATE candidates SET claude_verdict = ?, "
+                    "verdict_proba = ? WHERE id = ?",
+                    (verdict, verdict_proba, candidate_id))
+            else:
+                self._exec(
+                    "UPDATE candidates SET claude_verdict = ? WHERE id = ?",
+                    (verdict, candidate_id))
         else:
-            self._exec(
-                """UPDATE candidates SET claude_verdict = ?, claude_analysis = ?
-                   WHERE id = ?""",
-                (verdict, analysis, candidate_id))
+            if write_proba:
+                self._exec(
+                    """UPDATE candidates SET claude_verdict = ?,
+                       claude_analysis = ?, verdict_proba = ?
+                       WHERE id = ?""",
+                    (verdict, analysis, verdict_proba, candidate_id))
+            else:
+                self._exec(
+                    """UPDATE candidates SET claude_verdict = ?, claude_analysis = ?
+                       WHERE id = ?""",
+                    (verdict, analysis, candidate_id))
 
     def update_candidate_claude_batch(self, updates):
         """Update claude verdict + analysis for a batch of candidates.
@@ -2161,6 +2216,17 @@ class ExoNitDB:
 
     def get_task(self, task_id):
         return self._query_one("SELECT * FROM tasks WHERE task_id = ?", (task_id,))
+
+    def get_task_sector(self, task_id):
+        """tasks.sector for *task_id* (None if unknown/NULL/column absent)."""
+        if not task_id:
+            return None
+        try:
+            row = self._query_one("SELECT sector FROM tasks WHERE task_id = ?",
+                                  (task_id,))
+        except Exception:  # legacy DB without the tasks.sector migration
+            return None
+        return row["sector"] if row and row["sector"] is not None else None
 
     def assign_task(self, task_id, worker_id):
         """Mark task as assigned and increment attempts counter."""

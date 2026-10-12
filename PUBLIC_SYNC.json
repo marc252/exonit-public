@@ -1,8 +1,8 @@
 {
-  "internal_sha": "677997413e39b7ba628f65d2e02c7314659de2ea",
+  "internal_sha": "fbdd17169bf54049582222fb7e9aab9a97d7fc03",
   "swift_sha": "e4d48470d1edcf20bd3210736e6f517de1ec746b",
   "rust_sha": "dc99e5046b6c659b09015f9879445b921fd890f7",
   "dirty": false,
-  "exported_at": "2026-10-11T17:19:55+00:00",
+  "exported_at": "2026-10-12T17:18:03+00:00",
   "manifest_sha256": "0fb9cc2fd0011f0363e3be761e8e2d3cfc4756811e195c3c2f215b4e2470244c"
 }

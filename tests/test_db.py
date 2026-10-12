@@ -277,6 +277,36 @@ class TestUpdateCandidate:
         assert c["claude_verdict"] == "planet_candidate"
         assert c["claude_analysis"] == "Strong transit signal"
 
+    def test_verdict_proba_column_and_writes(self, db):
+        """P3: column exists; kwarg writes in both UPDATE branches; legacy
+        call leaves it untouched."""
+        cols = [r["name"] for r in db._query("PRAGMA table_info(candidates)")]
+        assert "verdict_proba" in cols
+        db.add_star("201", ra=0, dec=0, tmag=10, n_sectors=1,
+                    n_datapoints=1000, time_span_days=30)
+        db.add_candidate("201", candidate_num=1, period_days=5.0, t0=0,
+                         duration_days=0.1, depth_ppm=500, snr=15.0)
+        assert db.get_candidates("201")[0]["verdict_proba"] is None
+        # normal branch
+        db.update_candidate_claude(1, "planet_candidate", "",
+                                   verdict_proba=0.42)
+        assert db.get_candidates("201")[0]["verdict_proba"] == pytest.approx(0.42)
+        # legacy call (no kwarg) does not touch it
+        db.update_candidate_claude(1, "uncertain", "")
+        c = db.get_candidates("201")[0]
+        assert c["claude_verdict"] == "uncertain"
+        assert c["verdict_proba"] == pytest.approx(0.42)
+        # explicit None clears it
+        db.update_candidate_claude(1, "uncertain", "", verdict_proba=None)
+        assert db.get_candidates("201")[0]["verdict_proba"] is None
+        # keep-lora branch
+        db.update_candidate_claude(1, "uncertain", "[lora-v2] good text here")
+        db.update_candidate_claude(1, "planet_candidate", "", verdict_proba=0.7)
+        c = db.get_candidates("201")[0]
+        assert c["claude_analysis"] == "[lora-v2] good text here"
+        assert c["claude_verdict"] == "planet_candidate"
+        assert c["verdict_proba"] == pytest.approx(0.7)
+
     def test_update_exominer(self, db):
         db.add_star("250", ra=0, dec=0, tmag=10, n_sectors=1,
                     n_datapoints=1000, time_span_days=30)
@@ -937,3 +967,13 @@ class TestGetTaskStatsCached:
         assert db.get_task_stats() == {"pending": 1}
         db.add_task("t2", "222")
         assert db.get_task_stats() == {"pending": 2}
+
+
+def test_add_candidate_is_per_sector(tmp_path):
+    db = ExoNitDB(str(tmp_path / "t.db"))
+    i6 = db.add_candidate("9", 1, 3.0, 0.0, 0.1, 100.0, 10.0, sector=6)
+    i7 = db.add_candidate("9", 1, 6.01, 0.0, 0.1, 100.0, 10.0, sector=7)
+    i6b = db.add_candidate("9", 1, 3.5, 0.0, 0.1, 100.0, 10.0, sector=6)
+    assert i6 == i6b and i6 != i7
+    got = {r["sector"]: r["period_days"] for r in db.get_candidates("9")}
+    assert got == {6: 3.5, 7: 6.01}

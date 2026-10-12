@@ -400,6 +400,10 @@ def test_predict_verdict_returns_drop_in_dict_shape(tmp_path, monkeypatch):
     assert result["verdict"] in CLASS_NAMES
     assert 0.0 <= result["confidence"] <= 1.0
     assert "verdict_classifier" in result["model_used"]
+    # P3: raw P(planet) is exposed; for a planet verdict it equals confidence
+    assert 0.0 <= result["proba"] <= 1.0
+    if result["verdict"] == "planet_candidate":
+        assert result["proba"] == pytest.approx(result["confidence"])
 
 
 def test_predict_verdict_no_claude_api_key_required(tmp_path, monkeypatch):

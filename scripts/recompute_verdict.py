@@ -246,8 +246,9 @@ def _compute_verdict(candidate: dict, star_info: dict,
 # ---------------------------------------------------------------------------
 
 def _write_verdicts(dsn: str, sector: int,
-                    updates: list[tuple[str, str, int]]) -> int:
-    """UPDATE candidates.claude_verdict for a batch of (new_verdict, tic_id, cnum).
+                    updates: list[tuple[str, float | None, str, int]]) -> int:
+    """UPDATE claude_verdict + verdict_proba for a batch of
+    (new_verdict, proba, tic_id, cnum).
 
     Commits as a single transaction per batch. Returns rows actually updated.
     """
@@ -256,16 +257,17 @@ def _write_verdicts(dsn: str, sector: int,
     n_updated = 0
     with psycopg.connect(dsn) as conn:
         with conn.cursor() as cur:
-            for new_verdict, tic_id, cnum in updates:
+            for new_verdict, proba, tic_id, cnum in updates:
                 cur.execute(
                     """
                     UPDATE candidates
-                    SET claude_verdict = %s
+                    SET claude_verdict = %s,
+                        verdict_proba = %s
                     WHERE sector = %s
                       AND tic_id  = %s
                       AND candidate_num = %s
                     """,
-                    (new_verdict, sector, tic_id, cnum),
+                    (new_verdict, proba, sector, tic_id, cnum),
                 )
                 n_updated += cur.rowcount
         conn.commit()
@@ -385,7 +387,7 @@ def run_main(args) -> int:
     n_no_cand = 0
     n_no_star = 0
     n_sub_threshold = 0
-    pending_updates: list[tuple[str, str, int]] = []
+    pending_updates: list[tuple[str, float | None, str, int]] = []
     n_written = 0
     t0 = time.time()
 
@@ -425,7 +427,8 @@ def run_main(args) -> int:
         transitions.append((old_verdict, new_verdict))
 
         if not dry_run:
-            pending_updates.append((new_verdict, tic_id, cnum))
+            pending_updates.append(
+                (new_verdict, result.get("proba"), tic_id, cnum))
 
         # Flush batch
         if not dry_run and len(pending_updates) >= BATCH_SIZE:

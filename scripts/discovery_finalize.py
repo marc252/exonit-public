@@ -164,7 +164,7 @@ def _parse_dossier(dossier_path: str) -> dict:
 
     Returns dict with 'n_strong' and 'n_finalists' (int or None if not found).
     """
-    result: dict = {"n_strong": None, "n_finalists": None}
+    result: dict = {"n_strong": None, "n_finalists": None, "n_cross_sector": None}
     try:
         text = Path(dossier_path).read_text(encoding="utf-8")
     except Exception as exc:
@@ -185,6 +185,11 @@ def _parse_dossier(dossier_path: str) -> dict:
         result["n_finalists"] = int(m.group(1))
     else:
         logger.warning("n_finalists not found in dossier %s", dossier_path)
+
+    # Optional: "Cross-sector review queue: K TIC(s)."
+    m = re.search(r"Cross-sector review queue:\s*(\d+)\s*TIC", text)
+    if m:
+        result["n_cross_sector"] = int(m.group(1))
 
     return result
 
@@ -267,6 +272,9 @@ def _update_campaign(
         f" {n_completed}/{n_lot} completed, {n_failed} failed."
         f" {strong_str} strong (v6>0.5, post-veto), {finalist_str} finalists."
     )
+    n_cross = dossier_info.get("n_cross_sector")
+    if n_cross is not None:
+        new_status += f" {n_cross} cross-sector."
 
     # The line is a markdown table row: | ... | ... | ... | STATUS_CELL |
     # Replace only the last field (after the last | before the trailing |).

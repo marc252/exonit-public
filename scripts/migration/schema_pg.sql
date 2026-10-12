@@ -136,6 +136,11 @@ CREATE TABLE candidates (
     -- production DB this column is added by ALTER TABLE, not by re-running this
     -- file (same deploy note as exominer_status above).
     fpp_skip_reason           TEXT,
+    -- verdict_proba (P3): raw classifier P(planet), NULL = not computed. On the
+    -- already-migrated production DB this column is added manually (as
+    -- postgres): ALTER TABLE candidates ADD COLUMN IF NOT EXISTS
+    -- verdict_proba DOUBLE PRECISION; -- BEFORE deploying the server code.
+    verdict_proba             DOUBLE PRECISION,
     exominer_ffi_score        DOUBLE PRECISION,
     exominer_ffi_model_version TEXT,
     cross_source_name         TEXT,

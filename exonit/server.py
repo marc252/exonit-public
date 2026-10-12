@@ -1175,9 +1175,12 @@ def _run_verdict_background(db, tic_id, candidate, cnn_score):
             )[0]["id"],
             result["verdict"],
             analysis,
+            verdict_proba=result.get("proba"),
         )
-        logger.info("Verdict TIC %s #%s: %s (%.2f) [lora deferred to closeout]",
-                    tic_id, cand_num, result["verdict"], result["confidence"])
+        logger.info("Verdict TIC %s #%s: %s (%.2f) proba=%s "
+                    "[lora deferred to closeout]",
+                    tic_id, cand_num, result["verdict"], result["confidence"],
+                    result.get("proba"))
     except Exception as e:
         logger.warning("Verdict failed TIC %s: %s", tic_id, e)
 

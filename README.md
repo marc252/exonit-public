@@ -14,6 +14,10 @@ light curve. A server hands out work to a farm of worker machines; each worker r
 on its own GPU and reports the result. The project was built with substantial AI assistance (Claude, Anthropic)
 and without an astrophysicist on the team, which is exactly why the Confidence Ledger exists.
 
+**Results:** the raw outputs of every processed lot (per-lot scorecards, vetting dossiers, strong candidates and
+the blind TOI benchmark) are published in [exonit-results](https://github.com/marc252/exonit-results), under the
+same L0 disclaimer.
+
 ## How it works
 
 For every star the worker runs:

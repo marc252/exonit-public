@@ -20,6 +20,7 @@ Usage:
 """
 import argparse
 import csv
+import json
 import os
 import re
 import sqlite3
@@ -752,6 +753,52 @@ def _resolve_systematic_periods(pop, args, common_period_min_tics):
     return find_systematic_periods(pop, **kwargs)
 
 
+def _run_cross_sector_step(con, tics, sector, out_path, sample, stem_arg, min_snr):
+    """Step 1d. -> (n_tics or None, hits). None = skipped/failed (non-fatal)."""
+    if sector is None:
+        print("[cross-sector] --sector not given: step skipped")
+        return None, {}
+    try:
+        from exonit.cross_sector import (
+            find_cross_sector_hits, render_review_queue_md, review_queue_json)
+        cs_rows = []
+        for chunk in _select_in_chunks_iter(
+                con,
+                "SELECT id,tic_id,sector,period_days,t0,snr,claude_verdict,"
+                "exominer_ffi_score FROM candidates WHERE tic_id IN",
+                list(tics), sql_after="AND period_days IS NOT NULL"):
+            cs_rows.extend(dict(r) for r in chunk)
+        hits = find_cross_sector_hits(cs_rows, sector, min_snr=min_snr)
+        stem = stem_arg or (
+            out_path[:-len("_dossier.md")] + "_cross_sector"
+            if out_path.endswith("_dossier.md")
+            else str(Path(out_path).with_suffix("")) + "_cross_sector")
+        label = Path(sample).stem
+        Path(stem + ".md").write_text(render_review_queue_md(hits, label, sector))
+        Path(stem + ".json").write_text(json.dumps(
+            review_queue_json(hits, label, sector), indent=2, default=str))
+        print(f"[cross-sector] {len(hits)} TIC(s) with recurrence -> {stem}.{{md,json}}")
+        return len(hits), hits
+    except Exception as exc:  # non-fatal: report-only tail step
+        print(f"[cross-sector] WARNING step failed (non-fatal): {exc!r}")
+        return None, {}
+
+
+def _cross_sector_dossier_lines(n, hits):
+    if n is None:
+        return []
+    lines = ["", "## Cross-sector recurrence (review queue)", "",
+             f"Cross-sector review queue: {n} TIC(s)."]
+    for h in sorted(hits.values(),
+                    key=lambda h: (-h["cross_sector_hits"],
+                                   -(h["best"].get("snr") or 0), h["tic_id"]))[:20]:
+        m0 = h["matches"][0]
+        lines.append(f"- TIC {h['tic_id']}: {h['cross_sector_hits']} other sector(s), "
+                     f"P={m0['cur_period']:.4f} d ~ s{m0['other_sector']} "
+                     f"P={m0['other_period']:.4f} d ({m0['kind']})")
+    return lines
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sample", required=True)
@@ -760,6 +807,13 @@ def main():
     ap.add_argument("--db", default=None)
     ap.add_argument("--out", default="docs/discovery-vetting-dossier.md")
     ap.add_argument("--skip-fpp", action="store_true")
+    ap.add_argument("--sector", type=int, default=None,
+                    help="current sector of the lot; enables the cross-sector "
+                         "recurrence review queue (skipped when omitted)")
+    ap.add_argument("--cross-sector-out", default=None,
+                    help="output stem for the cross-sector queue (.md/.json); "
+                         "default: --out with _dossier.md replaced by _cross_sector")
+    ap.add_argument("--cross-sector-min-snr", type=float, default=0.0)
     ap.add_argument("--apply-veto", action="store_true", help="reclassify vetoed candidates in DB")
     ap.add_argument("--veto-scope", choices=["sample", "all", "campaign"], default="campaign",
                     help="population for systematic-period detection: 'sample' = current "
@@ -1078,6 +1132,11 @@ def main():
         con.commit()
         print(f"[deep-systematic] reclassified planet_candidate rows for "
               f"{len(to_update)} TICs ({len(eb_hosts)} hosts flagged)")
+
+    # --- Step 1d: cross-sector recurrence review queue (report only) ---
+    n_cross_sector, cross_sector_hits = _run_cross_sector_step(
+        con, tics, args.sector, args.out, args.sample,
+        args.cross_sector_out, args.cross_sector_min_snr)
 
     # --- Step 2+3: layer-3 vetting + layer-4 FPP on strong candidates ---
     from vetting import check_odd_even, check_v_shape  # worker module
@@ -1678,6 +1737,8 @@ def main():
             out.append("DB reclassification applied (cross_source_name='DEEP_SYSTEMATIC_VETO').")
         else:
             out.append("Report-only (--apply-deep-eclipse-veto not set; DB not modified).")
+
+    out += _cross_sector_dossier_lines(n_cross_sector, cross_sector_hits)
 
     Path(args.out).write_text("\n".join(out) + "\n")
     print(f"[dossier] escrit {args.out}")

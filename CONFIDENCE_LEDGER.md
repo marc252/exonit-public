@@ -2,7 +2,7 @@
 
 **Current Level: L0 — `vibe-coded`**
 
-This ledger tracks our confidence in ExoNit's *scientific* validity, not its software quality. The pipeline can be technically excellent while still producing astrophysically misleading results. Higher levels = more independent validation. **Going public requires L3 as a minimum**; L4 enables peer-reviewed publication.
+This ledger tracks our confidence in ExoNit's *scientific* validity, not its software quality. The pipeline can be technically excellent while still producing astrophysically misleading results. Higher levels = more independent validation. **Any public scientific claim requires L3 as a minimum**; L4 enables peer-reviewed publication. The code and the raw pipeline outputs are published at L0 as an openly experimental project (see the 2026-10-12 Log entry); that does not change the level.
 
 > Why this exists: ExoNit was built largely with AI assistance and without an astrophysicist on the team. The Confidence Ledger is the discipline that prevents that fact from leaking out as misleading public claims. Each level has explicit gating criteria — we move up only when every box for the next level is checked.
 
@@ -12,10 +12,10 @@ This ledger tracks our confidence in ExoNit's *scientific* validity, not its sof
 
 | Level | Tag | Meaning | What we can do at this level |
 |---|---|---|---|
-| **L0** | `vibe-coded` | Pipeline runs end-to-end. No formal validation against external truth, known scientific bugs may exist undetected. | Use it personally. Show the code privately. |
+| **L0** | `vibe-coded` | Pipeline runs end-to-end. No formal validation against external truth, known scientific bugs may exist undetected. | Use it personally. Publish the code and raw outputs only with the experimental disclaimer; no scientific claims, no ExoFOP submissions. |
 | **L1** | `documented-experimental` | All known bugs catalogued; honest scorecards against TOI catalog committed; regression tests cover bugs found so far; README contains a clear experimental disclaimer. | Show to technical friends with the disclaimer. |
 | **L2** | `internally-validated` | Sustained TOI parity over multiple months; CNN-FFI / ExoMiner-FFI deployed with per-source metrics; no critical KP/CP recall regressions for 6 months rolling; formal internal code audit done. | Approach an external reviewer with confidence. |
-| **L3** | `externally-reviewed` | At least one astrophysicist (PhD/postdoc in TESS exoplanets or TOI Working Group member) has read the code and validated the scientific decisions (vetting thresholds, BLS settings, TRICERATOPS calibration, CNN training set). Their findings are applied. | Publish on GitHub with their name in acknowledgements. Submit no candidates to ExoFOP without independent re-validation. |
+| **L3** | `externally-reviewed` | At least one astrophysicist (PhD/postdoc in TESS exoplanets or TOI Working Group member) has read the code and validated the scientific decisions (vetting thresholds, BLS settings, TRICERATOPS calibration, CNN training set). Their findings are applied. | Present results publicly as reviewed, with their name in acknowledgements. Submit no candidates to ExoFOP without independent re-validation. |
 | **L4** | `co-authored` | Active collaboration with an astrophysicist who signs future decisions. Submitted poster/paper to a TESS conference or journal. Repository is shared with co-authors. | Treat ExoNit as a real scientific instrument. ExoFOP submissions OK with co-author sign-off. |
 
 ---
@@ -67,6 +67,8 @@ Format: each entry is a dated row. New entries go *below*, oldest stays at the t
 | Date | Event | Category | Level impact |
 |---|---|---|---|
 | 2026-05-06 | Confidence Ledger system established. Project rescoped from "future public" to "personal until L3". | system | L0 declared |
+| 2026-09-19 | First blind TOI benchmark on discovery-grade data (TGLC only, 4,490 TOI hosts never processed before). KP+CP: signal at TOI period 65.0 %, verdict `planet_candidate` 20.1 %, strong-eligible 19.1 %; FP promoted 12.6 %. Artefacts: `benchmarks/toi_bench_tglc_2026-09-19.*` in [exonit-results](https://github.com/marc252/exonit-results). Establishes the per-source (FFI) recall metric required for L1→L2; no repeat run yet, so no noise band. | evidence | L0 (no change; first L1→L2 evidence item) |
+| 2026-10-12 | Publication policy revised: the code ([exonit-public](https://github.com/marc252/exonit-public), 2026-10-11) and the raw pipeline outputs ([exonit-results](https://github.com/marc252/exonit-results): per-lot scorecards, vetting dossiers, strong candidates, TOI benchmark) are published at L0 as an openly experimental project, with the disclaimer in every README. Publishing does not raise the level: L3 is still required before any scientific claim, before presenting any candidate as a discovery, and before any ExoFOP submission. | policy | L0 (no change) |
 
 ---
 

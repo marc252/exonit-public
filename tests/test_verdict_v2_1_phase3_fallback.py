@@ -187,3 +187,47 @@ def test_verdict_minus1_sentinel_matches_none_output_exactly(tmp_path, monkeypat
     # fallback actually engaged (the FFI score of 0.8 wins), not that both
     # paths coincidentally landed on the same fallback-free answer.
     assert result_none["verdict"] == "planet_candidate"
+
+
+# ---------------------------------------------------------------------------
+# P3: raw P(planet) is exposed as result["proba"]
+# ---------------------------------------------------------------------------
+
+def test_v2_1_proba_is_raw_p_planet(tmp_path, monkeypatch):
+    import exonit.verdict_classifier_v2_1 as v21
+    _save_tiny_v2_1_model(tmp_path)
+    monkeypatch.setenv("EXONIT_MODELS_DIR", str(tmp_path))
+    _load_v2_1_model.cache_clear()
+    monkeypatch.setattr(v21, "_predict_single_v2_1",
+                        lambda *a, **k: np.array([0.1, 0.2, 0.7]))
+    result = v21.predict_v2_1(dict(_NEUTRAL_CAND), star_info={})
+    assert result["verdict"] == "planet_candidate"
+    assert result["proba"] == pytest.approx(0.7)
+
+
+def test_v2_1_rescue_gate_keeps_raw_proba(tmp_path, monkeypatch):
+    """LFP flipped to planet by the rescue gate keeps the raw model p."""
+    import exonit.verdict_classifier_v2_1 as v21
+    _save_tiny_v2_1_model(tmp_path)
+    monkeypatch.setenv("EXONIT_MODELS_DIR", str(tmp_path))
+    _load_v2_1_model.cache_clear()
+    monkeypatch.setattr(v21, "_predict_single_v2_1",
+                        lambda *a, **k: np.array([0.8, 0.15, 0.05]))
+    cand = {**_NEUTRAL_CAND, "cnn_score": 0.99, "exominer_score": 0.99,
+            "triceratops_fpp": 0.0, "triceratops_nfpp": 0.0}
+    result = v21.predict_v2_1(cand, star_info={})
+    assert result["model_used"].endswith("+rescue")
+    assert result["verdict"] == "planet_candidate"
+    assert result["proba"] == pytest.approx(0.05)
+
+
+def test_v2_2_proba_both_branches(monkeypatch):
+    import exonit.verdict_classifier_v2_2 as v22
+    for thr in ({"lfp_threshold": 0.5, "pc_threshold": 0.5}, {}):
+        payload = {"stage1": None, "stage2": None, "feature_names": [],
+                   "top_sectors": [], "path": "m.pkl", **thr}
+        monkeypatch.setattr(v22, "_load_v2_2_model", lambda p=payload: p)
+        monkeypatch.setattr(v22, "_predict_single_v2_2_stages",
+                            lambda *a, **k: (0.2, 0.9))
+        result = v22.predict_v2_2({}, star_info={})
+        assert result["proba"] == pytest.approx((1 - 0.2) * 0.9)

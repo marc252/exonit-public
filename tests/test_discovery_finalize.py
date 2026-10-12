@@ -649,3 +649,13 @@ def test_orchestrator_finalize_non_fatal(tmp_path):
     # The bad_finalize patch is only called in non-dry-run, but dry_run=True
     # means step_finalize short-circuits before calling finalize_run.
     assert state["state"] == "DONE"
+
+
+def test_parse_dossier_cross_sector_line(tmp_path):
+    d = tmp_path / "d.md"
+    d.write_text("Strong candidates (v6>0.5, post-veto): 3.\n"
+                 "**Finalistes (x): 1**: 1\n"
+                 "Cross-sector review queue: 4 TIC(s).\n")
+    assert fin._parse_dossier(str(d))["n_cross_sector"] == 4
+    d.write_text("Strong candidates (v6>0.5, post-veto): 3.\n")
+    assert fin._parse_dossier(str(d))["n_cross_sector"] is None
