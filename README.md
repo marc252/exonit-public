@@ -1,3 +1,5 @@
+> **Notice (2026-10-18): code under major revision; contributions paused.** The pipeline is being reworked in depth (false-positive probability model, light-curve dilution handling, period aliases, vetting). The code here is an older snapshot and differs substantially from the version in progress. Pull requests and issues are paused until the next release, which will replace this snapshot. Thank you for your interest.
+
 # ExoNit
 
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
